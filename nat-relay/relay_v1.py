@@ -1,18 +1,14 @@
 """NRP/1 TCP stream adapter. Python 3.9+, no third-party dependencies."""
 import argparse
-import asyncio
 import base64
 import contextlib
-import getpass
 import hmac
 import ipaddress
 import json
 import socket
 import signal
-import ssl
 import struct
 from pathlib import Path
-import multipath
 
 MAGIC = b"NRP\x01"
 SERVICE_PORT = 18930
@@ -116,6 +112,8 @@ def connect_socks(port, host, target_port, password=None):
 
 
 async def open_egress(host, port, secret):
+    import asyncio
+
     for proxy_port in EGRESS:
         try:
             sock = await asyncio.to_thread(connect_socks, proxy_port, host, port, secret)
@@ -126,6 +124,8 @@ async def open_egress(host, port, secret):
 
 
 async def streams(plain, wire):
+    import asyncio
+
     async def encode():
         while True:
             block = await plain[0].read(32768)
@@ -153,6 +153,9 @@ async def streams(plain, wire):
 
 
 async def serve_connection(reader, writer, cfg, hub):
+    import asyncio
+    import multipath
+
     prefix = await asyncio.wait_for(reader.readexactly(4), TIMEOUT)
     if prefix == multipath.MAGIC:
         return await hub.accept(reader, writer, cfg)
@@ -183,6 +186,8 @@ async def serve_connection(reader, writer, cfg, hub):
 
 
 async def client_connection(reader, writer, cfg, ctx, via):
+    import asyncio
+
     wire = None
     async def handshake():
         nonlocal wire
@@ -224,7 +229,13 @@ async def client_connection(reader, writer, cfg, ctx, via):
 
 
 async def main_loop(a):
+    import asyncio
+    import ssl
+    import multipath
+
     if a.mode == "client" and str(a.config) == "-":
+        import getpass
+
         cfg = import_link(getpass.getpass("粘贴 nrp://v2/ 节点连接后按回车：").strip())
     else:
         cfg = json.loads(a.config.read_text(encoding="utf-8"))
@@ -280,6 +291,8 @@ async def main_loop(a):
 
 
 if __name__ == "__main__":
+    import asyncio
+
     p = argparse.ArgumentParser()
     p.add_argument("mode", choices=["server", "client"])
     p.add_argument("config", type=Path, help="配置文件路径；客户端填 - 可直接粘贴合并节点")
