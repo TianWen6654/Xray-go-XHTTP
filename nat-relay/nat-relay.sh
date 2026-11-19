@@ -77,7 +77,6 @@ if [[ $action == install ]]; then
     fi
 fi
 command -v python3 >/dev/null || fail '需要 Python 3.9 或更新版本。'
-python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))' || fail '需要 Python 3.9 或更新版本。'
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 cat > "$stage/install.py" <<'NRP_FILE_INSTALL_PY'
@@ -91,7 +90,6 @@ import hashlib
 import ipaddress
 import json
 import os
-import platform
 from pathlib import Path
 import re
 import secrets
@@ -99,17 +97,13 @@ import selectors
 import signal
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 from types import SimpleNamespace
 import tempfile
 import time
 from urllib.parse import quote, urlencode
-from urllib.request import urlopen
-from urllib.request import ProxyHandler, build_opener
 import uuid
-import zipfile
 
 ROOT = Path("/etc/nat-relay")
 UNIT = Path("/etc/systemd/system/nat-relay.service")
@@ -137,6 +131,8 @@ def mapping(value):
 
 
 def discover_ipv4():
+    from urllib.request import ProxyHandler, build_opener
+
     def public(text):
         try:
             ip = ipaddress.IPv4Address(text.strip())
@@ -314,6 +310,7 @@ def core():
     binary = shutil.which("sing-box")
     if binary:
         return binary
+    from urllib.request import urlopen
     # Use a signed private APT source. Extract the binary without enabling a
     # second distribution service or changing the system's repository list.
     with tempfile.TemporaryDirectory() as tmp:
@@ -521,6 +518,10 @@ def xray_binary():
     binary = shutil.which("xray")
     if binary or target.is_file():
         return binary or str(target)
+    import platform
+    from urllib.request import urlopen
+    import zipfile
+
     arch = {"x86_64": "64", "aarch64": "arm64-v8a"}.get(platform.machine())
     if not arch:
         raise ValueError("此架构请先安装官方 Xray-core")
@@ -819,10 +820,15 @@ def deploy(a):
     session = None
     if a.xhttp_temp or a.xhttp_h3:
         session = (ROOT / "xhttp.lock").open("a")
-        fcntl.flock(session, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(session, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("已有会话持有 XHTTP 锁，请回到原终端查看节点或结束该会话。") from None
         (ROOT / "xhttp-temp.txt").unlink(missing_ok=True)
     cert = key = None
     if a.udp or a.tcp or a.xhttp_h3:
+        import ssl
+
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(a.cert, a.key)
         run("openssl", "verify", "-verify_hostname", a.name, "-purpose", "sslserver",
@@ -948,6 +954,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        sys.exit("需要 Python 3.9 或更新版本。")
     try:
         main()
     except KeyboardInterrupt:
@@ -958,19 +966,15 @@ NRP_FILE_INSTALL_PY
 cat > "$stage/relay_v1.py" <<'NRP_FILE_RELAY_V1_PY'
 """NRP/1 TCP stream adapter. Python 3.9+, no third-party dependencies."""
 import argparse
-import asyncio
 import base64
 import contextlib
-import getpass
 import hmac
 import ipaddress
 import json
 import socket
 import signal
-import ssl
 import struct
 from pathlib import Path
-import multipath
 
 MAGIC = b"NRP\x01"
 SERVICE_PORT = 18930
@@ -1074,6 +1078,8 @@ def connect_socks(port, host, target_port, password=None):
 
 
 async def open_egress(host, port, secret):
+    import asyncio
+
     for proxy_port in EGRESS:
         try:
             sock = await asyncio.to_thread(connect_socks, proxy_port, host, port, secret)
@@ -1084,6 +1090,8 @@ async def open_egress(host, port, secret):
 
 
 async def streams(plain, wire):
+    import asyncio
+
     async def encode():
         while True:
             block = await plain[0].read(32768)
@@ -1111,6 +1119,9 @@ async def streams(plain, wire):
 
 
 async def serve_connection(reader, writer, cfg, hub):
+    import asyncio
+    import multipath
+
     prefix = await asyncio.wait_for(reader.readexactly(4), TIMEOUT)
     if prefix == multipath.MAGIC:
         return await hub.accept(reader, writer, cfg)
@@ -1141,6 +1152,8 @@ async def serve_connection(reader, writer, cfg, hub):
 
 
 async def client_connection(reader, writer, cfg, ctx, via):
+    import asyncio
+
     wire = None
     async def handshake():
         nonlocal wire
@@ -1182,7 +1195,13 @@ async def client_connection(reader, writer, cfg, ctx, via):
 
 
 async def main_loop(a):
+    import asyncio
+    import ssl
+    import multipath
+
     if a.mode == "client" and str(a.config) == "-":
+        import getpass
+
         cfg = import_link(getpass.getpass("粘贴 nrp://v2/ 节点连接后按回车：").strip())
     else:
         cfg = json.loads(a.config.read_text(encoding="utf-8"))
@@ -1238,6 +1257,8 @@ async def main_loop(a):
 
 
 if __name__ == "__main__":
+    import asyncio
+
     p = argparse.ArgumentParser()
     p.add_argument("mode", choices=["server", "client"])
     p.add_argument("config", type=Path, help="配置文件路径；客户端填 - 可直接粘贴合并节点")
@@ -1613,14 +1634,14 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-e62fda528113452761722f6b2d2df2ffba51326639406c44cdb17fc3e7e64956  install.py
-3dbd1008e62b2a9b24defda01e1605c6be327625082bccf2ec5b99829031d5f2  relay_v1.py
+2f9bfe5c9736c740b636c83dd68ddf439a4925fe191e7c627d3f3424af434a8a  install.py
+e5844ecdd58e984970df2b29af61bb7dfc9cd357f45ec140ea2993068cf1758d  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
 
 if [[ $action == check ]]; then
-    python3 -I -B -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]).resolve(); sys.path.insert(0,str(p)); import install,relay_v1,multipath; assert all(pathlib.Path(m.__file__).parent == p for m in (install,relay_v1,multipath))' "$stage"
+    python3 -I -B -c 'import pathlib,sys; sys.version_info >= (3, 9) or sys.exit("需要 Python 3.9 或更新版本。"); p=pathlib.Path(sys.argv[1]).resolve(); sys.path.insert(0,str(p)); import install,relay_v1,multipath; assert all(pathlib.Path(m.__file__).parent == p for m in (install,relay_v1,multipath))' "$stage"
     printf '%s\n' '通过：三个内嵌模块的 SHA-256 和 Python 导入检查均成功。'
     exit 0
 fi
@@ -1628,4 +1649,32 @@ if [[ $action == options ]]; then
     python3 -B "$stage/install.py" --help
     exit 0
 fi
-python3 -B "$stage/install.py" --multipath "$@"
+read_oom_kills() {
+    oom_kills=
+    local field count
+    if [[ -r /sys/fs/cgroup/memory.events ]]; then
+        while read -r field count; do
+            if [[ $field == oom_kill && $count =~ ^[0-9]+$ ]]; then
+                oom_kills=$count
+                break
+            fi
+        done < /sys/fs/cgroup/memory.events
+    fi
+}
+
+read_oom_kills
+oom_before=$oom_kills
+if python3 -B "$stage/install.py" --multipath "$@"; then
+    exit 0
+else
+    status=$?
+fi
+if [[ $status == 137 ]]; then
+    read_oom_kills
+    if [[ -n $oom_before && -n $oom_kills ]] && (( oom_kills > oom_before )); then
+        printf '安装期间检测到容器 OOM 杀进程（oom_kill %s → %s）。释放内存后再重试。\n' "$oom_before" "$oom_kills" >&2
+    else
+        printf '%s\n' '安装进程收到 SIGKILL。请查看容器内存和 memory.events 后再重试。' >&2
+    fi
+fi
+exit "$status"
