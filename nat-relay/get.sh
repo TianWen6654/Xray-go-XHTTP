@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Pin the artifact and its digest together when publishing a new version.
-url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/414888b94a3ec120ffda222f9bb5d1dcd147e955/nat-relay/nat-relay.sh'
-digest='29f03ff6e86d885811c2d493f932d31a53c29b0332aa59bd8fbbaf3b1d0d7290'
+url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/8f5c7edc2020402089923c77e7fa92293cfc3f13/nat-relay/nat-relay.sh'
+digest='40984bc9b2320bfad0e310f72713e1395e0bb39549e3b8f52af21745249dc1b8'
 
 download() {
     local target="$HOME/nat-relay.sh"
@@ -24,9 +24,8 @@ download() {
     mv -fT -- "$stage" "$target"
     printf '已校验并保存到 %s\n' "$target"
     if [[ ${1:-} == --download-only ]]; then return 0; fi
-    if [[ $# == 0 && ! -t 0 ]]; then
-        # The interactive installer reads its menu from the user's terminal.
-        bash "$target" </dev/tty
+    if [[ ! -t 0 ]] && ( : </dev/tty ) 2>/dev/null; then
+        bash "$target" "$@" </dev/tty
     else
         bash "$target" "$@"
     fi
