@@ -115,6 +115,7 @@ ROOT = Path("/etc/nat-relay")
 UNIT = Path("/etc/systemd/system/nat-relay.service")
 UNIT_MARK = "# Managed by nat-relay/install.py\n"
 UNIT_DATA = Path("/etc/nat-relay-unit-data")
+RUNTIME_UNITS = Path("/run/systemd/system")
 
 
 def run(*cmd, **kwargs):
@@ -352,20 +353,48 @@ def memory_budget():
     return max(16, min(128, total // 3))
 
 
+@contextmanager
+def runtime_unit(name, contents):
+    path = RUNTIME_UNITS / name
+    if path.is_symlink() or (path.exists() and not path.read_text().startswith(UNIT_MARK)):
+        raise ValueError(f"已有其他运行时服务使用 {path}")
+    atomic(path, contents.encode(), 0o644)
+    loaded = False
+    try:
+        run("systemctl", "daemon-reload")
+        fragment = run("systemctl", "show", "-p", "FragmentPath", "--value", name,
+                       stdout=subprocess.PIPE, text=True).stdout.strip()
+        if fragment != str(path):
+            raise ValueError(f"systemd 未加载 {path}（FragmentPath={fragment}）")
+        loaded = True
+        yield
+    finally:
+        if loaded:
+            subprocess.run(["systemctl", "stop", name])
+            subprocess.run(["systemctl", "reset-failed", name], capture_output=True)
+        path.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "daemon-reload"])
+
+
 @lru_cache(maxsize=1)
 def has_service_namespace():
     name = f"natr-probe-{uuid.uuid4().hex[:16]}.service"
-    result = subprocess.run(["systemd-run", "--quiet", "--wait", "--service-type=simple",
-                             "--unit", name, "-p", "DynamicUser=yes", "-p", "ProtectSystem=strict",
-                             "-p", "ProtectHome=yes", "-p", "LoadCredential=probe:/etc/os-release",
-                             "/bin/true"], capture_output=True, text=True)
-    if result.returncode == 0:
-        return True
-    status = subprocess.run(["systemctl", "show", name, "-p", "ExecMainStatus", "--value"],
-                            capture_output=True, text=True).stdout.strip()
-    subprocess.run(["systemctl", "reset-failed", name], capture_output=True)
-    if status not in {"226", "243"} and result.returncode not in (226, 243):
-        raise ValueError(f"systemd 服务探测失败（ExecMainStatus={status}）：{result.stderr.strip()}")
+    probe = UNIT_MARK + """[Service]
+Type=oneshot
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+LoadCredential=probe:/etc/os-release
+ExecStart=/bin/true
+"""
+    with runtime_unit(name, probe):
+        result = subprocess.run(["systemctl", "start", name], capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        status = run("systemctl", "show", "-p", "ExecMainStatus", "--value", name,
+                     stdout=subprocess.PIPE, text=True).stdout.strip()
+        if status not in {"226", "243"}:
+            raise ValueError(f"systemd 服务探测失败（ExecMainStatus={status}）：{result.stderr.strip()}")
     print("容器无法创建服务挂载命名空间，使用独立非登录账号读取各服务的私有配置。", flush=True)
     return False
 
@@ -463,7 +492,7 @@ def activate(binary, server, path, unit_path, arguments="run -c %d/config.json",
         raise
 
 
-def service_unit(binary, arguments, properties, capabilities):
+def service_unit(binary, arguments, properties, capabilities, restart="on-failure"):
     protection = "\n".join(properties)
     return UNIT_MARK + f"""[Unit]
 Description=NAT relay
@@ -479,7 +508,7 @@ Environment=GOMAXPROCS=1
 CapabilityBoundingSet={capabilities}
 AmbientCapabilities={capabilities}
 NoNewPrivileges=yes
-Restart=on-failure
+Restart={restart}
 RestartSec=3
 
 [Install]
@@ -721,18 +750,13 @@ def temporary_xhttp(binary, port, doh, password=None):
         atomic(config, encoded)
         run(binary, "run", "-test", "-c", config)
         with service_access(unit, config, encoded, {}, temporary=True) as (props, directory):
-            args = [arg for prop in props for arg in ("-p", prop)]
             capability = "CAP_NET_BIND_SERVICE" if port < 1024 else ""
-            run("systemd-run", "--collect", "--service-type=exec", "--unit", unit, *args,
-                "-p", "NoNewPrivileges=yes", "-p", f"AmbientCapabilities={capability}",
-                "-p", f"CapabilityBoundingSet={capability}", "-E", "GOMAXPROCS=1",
-                "-E", f"GOMEMLIMIT={memory_budget()}MiB", binary, "run", "-c", f"{directory}/config.json")
-            try:
+            definition = service_unit(binary, f'run -c "{directory}/config.json"', props, capability, restart="no")
+            with runtime_unit(unit, definition):
+                run("systemctl", "restart", unit)
                 time.sleep(1)
                 run("systemctl", "is-active", "--quiet", unit)
                 tunnel(port, uid, path, bool(password))
-            finally:
-                subprocess.run(["systemctl", "stop", unit])
 
 
 def deploy(a):
@@ -1539,7 +1563,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-30e67738b3be16d649f673df0edf2ba1aa963a55c44d78419c4be65802d016e9  install.py
+c5a1aec765188585330c602480ffb8e001d1c6aed68b730ed68f91bb8e5946ea  install.py
 3dbd1008e62b2a9b24defda01e1605c6be327625082bccf2ec5b99829031d5f2  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
