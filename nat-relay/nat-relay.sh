@@ -85,6 +85,8 @@ cat > "$stage/install.py" <<'NRP_FILE_INSTALL_PY'
 """Fixed-port sing-box and Xray installer for Debian/Ubuntu with systemd 247+."""
 import argparse
 import base64
+from contextlib import contextmanager, ExitStack
+from functools import lru_cache
 import hashlib
 import ipaddress
 import json
@@ -112,6 +114,7 @@ import zipfile
 ROOT = Path("/etc/nat-relay")
 UNIT = Path("/etc/systemd/system/nat-relay.service")
 UNIT_MARK = "# Managed by nat-relay/install.py\n"
+UNIT_DATA = Path("/etc/nat-relay-unit-data")
 
 
 def run(*cmd, **kwargs):
@@ -261,12 +264,14 @@ def generate(a, keys, cert, key):
     return server, client, links
 
 
-def atomic(path, data, mode=0o600):
+def atomic(path, data, mode=0o600, gid=None):
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
         tmp = Path(f.name)
         try:
             f.write(data)
             f.flush()
+            if gid is not None:
+                os.fchown(f.fileno(), 0, gid)
             os.fchmod(f.fileno(), mode)
         except BaseException:
             tmp.unlink()
@@ -347,60 +352,139 @@ def memory_budget():
     return max(16, min(128, total // 3))
 
 
-def activate(binary, server, path, unit_path, arguments="run -c %d/config.json", credentials="",
+@lru_cache(maxsize=1)
+def has_service_namespace():
+    name = f"natr-probe-{uuid.uuid4().hex[:16]}.service"
+    result = subprocess.run(["systemd-run", "--quiet", "--wait", "--service-type=simple",
+                             "--unit", name, "-p", "DynamicUser=yes", "-p", "ProtectSystem=strict",
+                             "-p", "ProtectHome=yes", "-p", "LoadCredential=probe:/etc/os-release",
+                             "/bin/true"], capture_output=True, text=True)
+    if result.returncode == 0:
+        return True
+    status = subprocess.run(["systemctl", "show", name, "-p", "ExecMainStatus", "--value"],
+                            capture_output=True, text=True).stdout.strip()
+    subprocess.run(["systemctl", "reset-failed", name], capture_output=True)
+    if status not in {"226", "243"} and result.returncode not in (226, 243):
+        raise ValueError(f"systemd 服务探测失败（ExecMainStatus={status}）：{result.stderr.strip()}")
+    print("容器无法创建服务挂载命名空间，使用独立非登录账号读取各服务的私有配置。", flush=True)
+    return False
+
+
+def service_gid(name):
+    import grp
+    import pwd
+    marker = "NAT relay service " + name
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        run("useradd", "--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent",
+            "--shell", "/usr/sbin/nologin", "--comment", marker, name)
+        account = pwd.getpwnam(name)
+    group = grp.getgrgid(account.pw_gid)
+    if (account.pw_uid == 0 or account.pw_gid == 0 or account.pw_gecos != marker
+            or account.pw_shell != "/usr/sbin/nologin" or group.gr_name != name or group.gr_mem):
+        raise ValueError(f"服务账号或组已被占用：{name}")
+    return account.pw_gid
+
+
+@contextmanager
+def service_access(unit, config_path, encoded, extra, temporary=False):
+    sources = {"config.json": config_path, **extra}
+    if has_service_namespace():
+        properties = ["DynamicUser=yes", "ProtectSystem=strict", "ProtectHome=yes"]
+        properties.extend(f"LoadCredential={key}:{value}" for key, value in sources.items())
+        yield properties, f"/run/credentials/{unit}" if temporary else "%d"
+        return
+    name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
+            "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-temp.service": "natr-temp"}[unit]
+    gid = service_gid(name)
+    directory = UNIT_DATA / name
+    for folder in (UNIT_DATA, directory):
+        folder.mkdir(mode=0o700, exist_ok=True)
+        st = folder.lstat()
+        if folder.is_symlink() or st.st_uid != 0 or st.st_mode & 0o022:
+            raise ValueError(f"服务配置目录权限异常：{folder}")
+    UNIT_DATA.chmod(0o711)
+    os.chown(directory, 0, gid)
+    directory.chmod(0o710)
+    with ExitStack() as restore:
+        for key, source in sources.items():
+            data = encoded if key == "config.json" else source.read_bytes()
+            target = directory / key
+            if target.exists() and not temporary:
+                old = target.read_bytes()
+                if old == data and target.stat().st_gid == gid and target.stat().st_mode & 0o777 == 0o640:
+                    continue
+                restore.callback(atomic, target, old, 0o640, gid)
+            else:
+                restore.callback(target.unlink, missing_ok=True)
+            atomic(target, data, 0o640, gid)
+        yield [f"User={name}", f"Group={name}", "UMask=0077"], str(directory)
+        if not temporary:
+            restore.pop_all()
+
+
+def activate(binary, server, path, unit_path, arguments="run -c %d/config.json", credentials=None,
              reuse_active=False):
     if unit_path.exists() and not unit_path.read_text().startswith(UNIT_MARK):
         raise ValueError(f"已有其他服务使用 {unit_path}")
     old = path.read_bytes() if path.exists() else None
     old_unit = unit_path.read_bytes() if unit_path.exists() else None
-    capabilities = "" if credentials else "CAP_NET_BIND_SERVICE"
-    unit = UNIT_MARK + f"""[Unit]
+    ports = (inbound.get("listen_port", inbound.get("port", 0)) for inbound in server.get("inbounds", []))
+    capabilities = "CAP_NET_BIND_SERVICE" if any(0 < port < 1024 for port in ports) else ""
+    encoded = dump(server).encode()
+    installing = False
+    try:
+        with service_access(unit_path.name, path, encoded, credentials or {}) as (props, directory):
+            unit = service_unit(binary, arguments.replace("%d", directory), props, capabilities).encode()
+            if (reuse_active and old == encoded and old_unit == unit
+                    and subprocess.run(["systemctl", "is-active", "--quiet", unit_path.name]).returncode == 0):
+                run("systemctl", "enable", unit_path.name)
+                return
+            installing = True
+            atomic(path, encoded)
+            atomic(unit_path, unit, 0o644)
+            run("systemctl", "daemon-reload")
+            run("systemctl", "restart", unit_path.name)
+            time.sleep(2)
+            run("systemctl", "is-active", "--quiet", unit_path.name)
+            run("systemctl", "enable", unit_path.name)
+    except BaseException:
+        if installing:
+            subprocess.run(["systemctl", "stop", unit_path.name])
+            for dest, data, mode in ((unit_path, old_unit, 0o644), (path, old, 0o600)):
+                if data is None:
+                    dest.unlink(missing_ok=True)
+                else:
+                    atomic(dest, data, mode)
+            run("systemctl", "daemon-reload")
+            if old_unit and old:
+                run("systemctl", "start", unit_path.name)
+        raise
+
+
+def service_unit(binary, arguments, properties, capabilities):
+    protection = "\n".join(properties)
+    return UNIT_MARK + f"""[Unit]
 Description=NAT relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-DynamicUser=yes
-LoadCredential=config.json:{path}
-{credentials}ExecStart="{binary}" {arguments}
+{protection}
+ExecStart="{binary}" {arguments}
 Environment=GOMEMLIMIT={memory_budget()}MiB
 Environment=GOMAXPROCS=1
 CapabilityBoundingSet={capabilities}
 AmbientCapabilities={capabilities}
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 """
-    encoded = dump(server).encode()
-    if (reuse_active and old == encoded and old_unit == unit.encode()
-            and subprocess.run(["systemctl", "is-active", "--quiet", unit_path.name]).returncode == 0):
-        run("systemctl", "enable", unit_path.name)
-        return
-    try:
-        atomic(path, encoded)
-        atomic(unit_path, unit.encode(), 0o644)
-        run("systemctl", "daemon-reload")
-        run("systemctl", "restart", unit_path.name)
-        time.sleep(2)
-        run("systemctl", "is-active", "--quiet", unit_path.name)
-        run("systemctl", "enable", unit_path.name)
-    except BaseException:
-        subprocess.run(["systemctl", "stop", unit_path.name])
-        for dest, data, mode in ((unit_path, old_unit, 0o644), (path, old, 0o600)):
-            if data is None:
-                dest.unlink(missing_ok=True)
-            else:
-                atomic(dest, data, mode)
-        run("systemctl", "daemon-reload")
-        if old_unit and old:
-            run("systemctl", "start", unit_path.name)
-        raise
 
 
 def xray_binary():
@@ -519,7 +603,7 @@ def setup_v1(keys):
     config = dict(version=1, token=keys["nrp_token"], egress_password=keys["nrp_egress"],
                   runtime_sha256=hashlib.sha256(code + module).hexdigest(),
                   certificate_sha256=hashlib.sha256(certificate.encode()).hexdigest())
-    cred = "".join(f"LoadCredential={n}:{directory / n}\n" for n in ("cert.pem","key.pem"))
+    cred = {n: directory / n for n in ("cert.pem","key.pem")}
     activate(sys.executable, config, ROOT / "nrp-server.json", UNIT.with_name("nat-relay-v1.service"),
              f'-B "{program}" server %d/config.json', cred, reuse_active=True)
     atomic(ROOT / "relay-v1.json", dump(dict(version=1, token=config["token"],
@@ -633,22 +717,22 @@ def temporary_xhttp(binary, port, doh, password=None):
     unit = "nat-relay-xhttp-temp.service"
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
         config = Path(tmp) / "temp.json"
-        atomic(config, dump(server).encode())
+        encoded = dump(server).encode()
+        atomic(config, encoded)
         run(binary, "run", "-test", "-c", config)
-        run("systemd-run", "--collect", "--service-type=exec", "--unit", unit,
-            "-p", "DynamicUser=yes", "-p", "NoNewPrivileges=yes",
-            "-p", "ProtectSystem=strict", "-p", "ProtectHome=yes",
-            "-p", "AmbientCapabilities=CAP_NET_BIND_SERVICE",
-            "-p", "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
-            "-p", f"LoadCredential=config.json:{config}", "-E", "GOMAXPROCS=1",
-            "-E", f"GOMEMLIMIT={memory_budget()}MiB", binary, "run", "-c",
-            f"/run/credentials/{unit}/config.json")
-        try:
-            time.sleep(1)
-            run("systemctl", "is-active", "--quiet", unit)
-            tunnel(port, uid, path, bool(password))
-        finally:
-            subprocess.run(["systemctl", "stop", unit])
+        with service_access(unit, config, encoded, {}, temporary=True) as (props, directory):
+            args = [arg for prop in props for arg in ("-p", prop)]
+            capability = "CAP_NET_BIND_SERVICE" if port < 1024 else ""
+            run("systemd-run", "--collect", "--service-type=exec", "--unit", unit, *args,
+                "-p", "NoNewPrivileges=yes", "-p", f"AmbientCapabilities={capability}",
+                "-p", f"CapabilityBoundingSet={capability}", "-E", "GOMAXPROCS=1",
+                "-E", f"GOMEMLIMIT={memory_budget()}MiB", binary, "run", "-c", f"{directory}/config.json")
+            try:
+                time.sleep(1)
+                run("systemctl", "is-active", "--quiet", unit)
+                tunnel(port, uid, path, bool(password))
+            finally:
+                subprocess.run(["systemctl", "stop", unit])
 
 
 def deploy(a):
@@ -1455,7 +1539,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-afb6a499c9f3528fdac45c78fffc5327c084b648a10f043f8f14de29fbe6e225  install.py
+30e67738b3be16d649f673df0edf2ba1aa963a55c44d78419c4be65802d016e9  install.py
 3dbd1008e62b2a9b24defda01e1605c6be327625082bccf2ec5b99829031d5f2  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
