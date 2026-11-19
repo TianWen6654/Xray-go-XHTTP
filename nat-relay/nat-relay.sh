@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
-  sudo bash nat-relay.sh                 交互选择部署模式
+  sudo bash nat-relay.sh                 自动配置 Snell 6 和临时 XHTTP，只问 TCP 端口
+  sudo bash nat-relay.sh --menu          选择其他部署模式
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
   sudo bash nat-relay.sh --ip IP --snell 公网端口:内部端口
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
@@ -31,6 +32,9 @@ if [[ $action == install ]]; then
     [[ -d /run/systemd/system ]] || fail '当前系统没有运行 systemd。'
     command -v apt-get >/dev/null || fail '此安装器需要 Debian/Ubuntu 的 apt-get。'
     if [[ $# == 0 ]]; then
+        [[ -t 0 ]] || fail '请在终端启动，或用 --auto --snell 公网端口:内部端口。'
+        set -- --auto
+    elif [[ $# == 1 && $1 == --menu ]]; then
         [[ -t 0 ]] || fail '非交互运行需要提供协议参数。可执行 bash nat-relay.sh --help。'
         printf '%s\n' \
             '1) Snell 6 + 临时 XHTTP（一个 TCP 映射，无需自备证书）' \
@@ -42,9 +46,13 @@ if [[ $action == install ]]; then
         case "$mode" in 1|2|3|4) ;; *) fail '请选择 1 至 4';; esac
         params=()
         if [[ $mode != 4 ]]; then
-            read -r -p '服务商分配的 NAT 公网 IPv4: ' ip
-            read -r -p 'TCP 映射（公网端口:内部端口）: ' tcp
-            params+=(--ip "$ip" --snell "$tcp")
+            while :; do
+                read -r -p 'TCP 映射（同端口填一个数字，不同则填公网端口:内部端口）: ' tcp || fail '终端输入已关闭。'
+                [[ -n $tcp ]] && break
+                printf '%s\n' '请输入端口号。'
+            done
+            [[ $tcp == *:* ]] || tcp="$tcp:$tcp"
+            params+=(--snell "$tcp")
         fi
         if [[ $mode == 2 ]]; then
             read -r -p 'UDP 映射（公网端口:内部端口）: ' udp
@@ -88,6 +96,7 @@ import secrets
 import selectors
 import signal
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -96,6 +105,7 @@ import tempfile
 import time
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 import uuid
 import zipfile
 
@@ -120,6 +130,62 @@ def mapping(value):
     except ValueError:
         pass
     raise argparse.ArgumentTypeError("映射应为 公网端口:内部端口，范围 1–65535")
+
+
+def discover_ipv4():
+    def public(text):
+        try:
+            ip = ipaddress.IPv4Address(text.strip())
+        except ValueError:
+            return None
+        return ip if ip.is_global and not ip.is_multicast else None
+
+    ssh = os.environ.get("SSH_CONNECTION", "").split()
+    address = public(ssh[2]) if len(ssh) == 4 else None
+    if address:
+        print(f"SSH 服务端公网地址 {address}", flush=True)
+        return address
+    opener = build_opener(ProxyHandler({}))
+    for endpoint in ("https://api.ipify.org", "https://ipv4.icanhazip.com"):
+        try:
+            with opener.open(endpoint, timeout=5) as response:
+                address = public(response.read(64).decode("ascii"))
+        except (OSError, UnicodeError):
+            continue
+        if address:
+            print(f"检测到出口 IPv4 {address}。若与面板的 NAT 入口不同，请用 --ip 指定入口。", flush=True)
+            return address
+    raise ValueError("无法探测公网 IPv4。请用 --auto --ip 面板入口IPv4 重试。")
+
+
+def quick_setup(a):
+    from relay_v1 import EGRESS, SERVICE_PORT
+    reserved = (SERVICE_PORT, *EGRESS)
+    while not a.snell:
+        try:
+            value = input("TCP 端口（如 10880；端口不同时填 公网端口:内部端口）：").strip()
+        except EOFError:
+            raise ValueError("终端输入已关闭。可以用 --auto --snell 公网端口:内部端口。") from None
+        try:
+            ports = mapping(value if ":" in value else f"{value}:{value}")
+            if ports[1] in reserved:
+                raise ValueError("内部端口 18930–18933 已保留。")
+            a.snell = ports
+        except (argparse.ArgumentTypeError, ValueError) as error:
+            print(error, file=sys.stderr)
+    a.xhttp_temp = True
+    # Probe the loopback listener without changing the public NAT mapping.
+    for port in range(8001, 8102):
+        if port == a.snell[1]:
+            continue
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        a.origin_port = port
+        return
+    raise ValueError("没有可用的本地回源端口，请使用 --xhttp-temp --origin-port 指定。")
 
 
 def domain(value):
@@ -394,7 +460,7 @@ def xhttp_carrier(host, port, sni, alpn, uid, path, tag):
                 **{"xhttp-opts": {"mode": "packet-up", "path": path}})
 
 
-def publish_carriers(group, proxies, bootstrap=None, exit_doh=None):
+def publish_carriers(group, proxies, bootstrap=None, exit_doh=None, announce=True):
     """Persist each independently installed group's state and rebuild under one lock."""
     import fcntl
     with (ROOT / "carriers.lock").open("a") as lock:
@@ -422,7 +488,12 @@ def publish_carriers(group, proxies, bootstrap=None, exit_doh=None):
         profile["proxy-groups"][0]["proxies"] = [p["name"] for p in nodes]
         atomic(target, dump(profile).encode())
         client = json.loads((ROOT / "relay-v1.json").read_text())
-        atomic(bundle, dump(dict(client, version=2, carriers=profile)).encode())
+        config = dict(client, version=2, carriers=profile)
+        atomic(bundle, dump(config).encode())
+        if proxies and announce:
+            from relay_v1 import share_link
+            print("NRP/2 合并节点（" + " + ".join(p["name"] for p in nodes) + "）",
+                  share_link(config), sep="\n", flush=True)
 
 
 def setup_v1(keys):
@@ -626,7 +697,8 @@ def deploy(a):
         atomic(ROOT / "client.json", dump(client).encode())
         profile = mihomo_profile(a, client)
         atomic(ROOT / "mihomo.yaml", dump(profile).encode())
-        publish_carriers("singbox", profile["proxies"] if a.relay_v1 else [], a.bootstrap_doh, a.exit_doh)
+        publish_carriers("singbox", profile["proxies"] if a.relay_v1 else [], a.bootstrap_doh, a.exit_doh,
+                         announce=not a.xhttp_temp)
         surge = ROOT / "snell-surge.conf"
         if a.snell:
             snell_client = dict(client, outbounds=[n for n in client["outbounds"] if n["type"] == "snell"],
@@ -634,11 +706,14 @@ def deploy(a):
             atomic(ROOT / "snell-v2rayn.json", dump(snell_client).encode())
             line = f"Snell6 = snell, {a.ip}, {a.snell[0]}, psk={keys['snell_psk']}, version=6"
             atomic(surge, ("[Proxy]\n" + line + "\n").encode())
+            print("Surge 策略行", line, sep="\n")
             print(f"Snell 6 已写入 {surge}、client.json 和 mihomo.yaml")
         else:
             surge.unlink(missing_ok=True)
             (ROOT / "snell-v2rayn.json").unlink(missing_ok=True)
-        print(*links, sep="\n")
+        print(*links, sep="\n", flush=True)
+        if a.xhttp_temp:
+            print("等待临时 XHTTP 域名。分配成功后将在这里输出含 XHTTP 的合并节点，请保持终端打开。", flush=True)
     if a.xhttp_temp or a.xhttp_h3:
         binary = xray_binary()
     if a.xhttp_h3:
@@ -671,6 +746,7 @@ def deploy(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--auto", action="store_true", help="仅输入 TCP 映射，自动选择临时 XHTTP 回源端口")
     p.add_argument("--ip", type=ipaddress.IPv4Address, help="NAT 公网 IPv4")
     p.add_argument("--name", type=domain, help="直连 TLS 证书域名")
     p.add_argument("--cert", type=Path, help="受信任的完整证书链")
@@ -685,6 +761,8 @@ def main():
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.auto:
+        quick_setup(a)
     if a.relay_v1:
         if not all(Path(__file__).with_name(n).is_file() for n in ("relay_v1.py", "multipath.py")):
             p.error("请把 relay_v1.py、multipath.py 与 install.py 放在同一目录")
@@ -698,7 +776,7 @@ def main():
     if not (direct or a.snell or a.xhttp_temp):
         p.error("请指定一种入站或 --xhttp-temp")
     if (direct or a.snell) and not a.ip:
-        p.error("公网直连模式需要 --ip")
+        a.ip = discover_ipv4()
     if direct and not (a.name and a.cert and a.key):
         p.error("直连 TLS 入站需要 --name、--cert 和 --key")
     if (a.cdn and not a.tcp) or not all(1 <= i <= 65535 for i in [a.edge_port, a.origin_port]):
@@ -723,7 +801,9 @@ cat > "$stage/relay_v1.py" <<'NRP_FILE_RELAY_V1_PY'
 """NRP/1 TCP stream adapter. Python 3.9+, no third-party dependencies."""
 import argparse
 import asyncio
+import base64
 import contextlib
+import getpass
 import hmac
 import ipaddress
 import json
@@ -739,6 +819,49 @@ SERVICE_PORT = 18930
 EGRESS = (18931, 18932, 18933)
 LIMIT = 32
 TIMEOUT = 12
+
+
+def share_link(cfg):
+    profile = cfg["carriers"]
+    dns = profile["dns"]
+    payload = [cfg["token"], cfg["certificate"], profile["proxies"],
+               dns["proxy-server-nameserver"][0], dns["nameserver"][0]]
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    return "nrp://v2/" + base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def import_link(link):
+    import re
+    prefix = "nrp://v2/"
+    if not link.startswith(prefix) or len(link) > 65536:
+        raise ValueError("需要完整的 nrp://v2/ 节点连接。")
+    try:
+        body = link[len(prefix):]
+        data = base64.b64decode(body + "=" * (-len(body) % 4), altchars=b"-_", validate=True)
+        token, cert, nodes, bootstrap, resolver = json.loads(data)
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", token) or not 1 <= len(nodes) <= 6:
+            raise ValueError
+        if not isinstance(cert, str) or not cert.startswith("-----BEGIN CERTIFICATE-----"):
+            raise ValueError
+        for url, suffix in ((bootstrap, "/dns-query"), (resolver, "/dns-query#Auto")):
+            if not url.startswith("https://") or not url.endswith(suffix):
+                raise ValueError
+            ipaddress.IPv4Address(url[8:-len(suffix)])
+        allowed = {"name","type","server","port","udp","version","psk","password","sni",
+                   "uuid","network","tls","servername","alpn","ws-opts","xhttp-opts"}
+        for node in nodes:
+            if node["type"] not in ("vless","snell","hysteria2") or set(node) - allowed:
+                raise ValueError
+            if not isinstance(node["port"], int) or not 1 <= node["port"] <= 65535:
+                raise ValueError
+            if set(node.get("ws-opts", {})) - {"path","headers"} or set(node.get("xhttp-opts", {})) - {"mode","path"}:
+                raise ValueError
+        profile = {"mode":"rule", "allow-lan":False, "log-level":"warning", "proxies":nodes,
+                   "rules":["MATCH,Auto"], "dns":{"enable":True,"ipv6":False,
+                   "proxy-server-nameserver":[bootstrap],"nameserver":[resolver]}}
+        return dict(version=2, token=token, certificate=cert, carriers=profile)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError("NRP/2 节点连接不完整或格式错误。") from exc
 
 
 async def address(reader, kind):
@@ -901,7 +1024,10 @@ async def client_connection(reader, writer, cfg, ctx, via):
 
 
 async def main_loop(a):
-    cfg = json.loads(a.config.read_text(encoding="utf-8"))
+    if a.mode == "client" and str(a.config) == "-":
+        cfg = import_link(getpass.getpass("粘贴 nrp://v2/ 节点连接后按回车：").strip())
+    else:
+        cfg = json.loads(a.config.read_text(encoding="utf-8"))
     if cfg.get("version") not in (1, 2) or len(bytes.fromhex(cfg["token"])) != 32:
         raise ValueError("unsupported or invalid NRP profile")
     server = a.mode == "server"
@@ -956,7 +1082,7 @@ async def main_loop(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("mode", choices=["server", "client"])
-    p.add_argument("config", type=Path)
+    p.add_argument("config", type=Path, help="配置文件路径；客户端填 - 可直接粘贴合并节点")
     p.add_argument("--via-port", type=int, default=2080)
     p.add_argument("--listen-port", type=int, default=2081)
     p.add_argument("--mihomo", default="mihomo", help="NRP/2 底层核心的可执行文件")
@@ -1329,8 +1455,8 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-2ea2b1abcf2c410f273a2b814ff137e0d4d832f2af71f7e0f86b66d3aa71ecc5  install.py
-51cfce2db42e0ae76f1ffa07a7097287e818e98919e40d4d460881e6b8a25ede  relay_v1.py
+afb6a499c9f3528fdac45c78fffc5327c084b648a10f043f8f14de29fbe6e225  install.py
+3dbd1008e62b2a9b24defda01e1605c6be327625082bccf2ec5b99829031d5f2  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
@@ -1344,6 +1470,4 @@ if [[ $action == options ]]; then
     python3 -B "$stage/install.py" --help
     exit 0
 fi
-printf '%s\n' '安装成功并生成节点后，客户端配置位于 /etc/nat-relay/relay-node.json。' \
-    '临时 XHTTP 在前台运行；请保持此会话，并用另一个 SSH/SFTP 会话取回配置。'
 python3 -B "$stage/install.py" --multipath "$@"
