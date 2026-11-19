@@ -661,6 +661,74 @@ def enable_carrier(server, kind, password):
             port=socks_port, settings={"auth": "password", "accounts": [{"user":"nrp","pass":password}]}))
 
 
+def assigned_host(line):
+    """Read only allocation records; banners and forwarded request URLs are not nodes."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        match = re.match(r"^([a-z0-9.-]+)\s+tunneled with tls\b", line.strip(), re.I)
+        if not match:
+            return None
+        address = match[1]
+    else:
+        if not isinstance(event, dict):
+            return None
+        if event.get("type") == "run.localhost.tunnel.registered":
+            data = event.get("data")
+            address = data.get("address") if isinstance(data, dict) else None
+        elif event.get("event") == "tcpip-forward":
+            if event.get("status") in ("error", "failed", "failure", "denied"):
+                reason = str(event.get("message") or event["status"]).splitlines()[0]
+                raise ValueError("网关拒绝分配临时域名：" + "".join(c for c in reason if c.isprintable())[:240])
+            address = event.get("address") if event.get("status", "success") == "success" else None
+        else:
+            return None
+    if not isinstance(address, str):
+        return None
+    try:
+        host = domain(address)
+    except argparse.ArgumentTypeError:
+        return None
+    if host.endswith((".lhr.life", ".lhr.rocks", ".localhost.run")) and host != "admin.localhost.run":
+        return host
+    return None
+
+
+def tunnel_hosts(stream, timeout=60):
+    deadline = time.monotonic() + timeout
+    current = None
+    pending = b""
+    skipping = False
+    with selectors.DefaultSelector() as poll:
+        poll.register(stream, selectors.EVENT_READ)
+        while True:
+            remaining = max(0, deadline - time.monotonic()) if current is None else None
+            if remaining == 0 or not poll.select(remaining):
+                raise ValueError("临时域名分配超时：未收到有效的网关注册事件。")
+            chunk = stream.read1(16384)
+            lines = (pending + chunk).split(b"\n")
+            pending = lines.pop() if chunk else b""
+            for raw in lines:
+                if skipping:
+                    skipping = False
+                    continue
+                line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw.decode(errors="replace")).strip()
+                host = assigned_host(line)
+                if host and current != host:
+                    current = host
+                    yield host
+                elif current is None and (line.startswith(("ssh:", "Error: remote port forwarding failed"))
+                                          or "Permission denied (" in line):
+                    raise ValueError(f"SSH 转发失败：{line[:300]}")
+            if len(pending) > 262144:
+                pending = b""
+                skipping = True
+            if not chunk:
+                if current is None:
+                    raise ValueError("SSH 会话已关闭，网关未返回有效的临时域名。")
+                return
+
+
 def tunnel(port, uid, path, relay=False):
     # The edge host key is published at https://localhost.run/docs/security.
     scan = run("ssh-keyscan", "-T", "10", "-t", "ed25519", "localhost.run",
@@ -681,43 +749,25 @@ def tunnel(port, uid, path, relay=False):
                "-o", "IdentityAgent=none", "-o", "PubkeyAuthentication=no",
                "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=20",
                "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=15",
-               "-R", f"80:127.0.0.1:{port}", "nokey@localhost.run"]
+               "-R", f"80:127.0.0.1:{port}", "nokey@localhost.run", "--", "--output", "json"]
     output = ROOT / "xhttp-temp.txt"
     output.unlink(missing_ok=True)
     print(f"正在申请临时域名，回源 127.0.0.1:{port}；Ctrl+C 关闭。", flush=True)
-    # Capture only the assigned hostname; exclude banners and request logs.
-    assigned = re.compile(r"(?<![\w.-])([a-z0-9-]+\.(?:lhr\.life|lhr\.rocks|localhost\.run))\s+tunneled\s+with\s+tls", re.I)
-    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
-        with selectors.DefaultSelector() as poll:
-            poll.register(proc.stdout, selectors.EVENT_READ)
-            deadline = time.monotonic() + 45
-            banner = ""
-            while not output.exists():
-                if not poll.select(max(0, deadline - time.monotonic())) or time.monotonic() >= deadline:
-                    raise ValueError("等待临时域名超时，请检查网关可达性和域名分配情况")
-                chunk = os.read(proc.stdout.fileno(), 4096)
-                if not chunk:
-                    raise ValueError("网关未返回临时域名，请检查出站 TCP 22 和服务商状态")
-                banner = (banner + chunk.decode(errors="replace"))[-16384:]
-                clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", banner)
-                match = assigned.search(clean) or re.search(
-                    r"https://([a-z0-9-]+\.lhr\.life)(?=[/\s])", clean, re.I)
-                if match:
-                    host = match[1].lower()
-                    link = xhttp_link(host, 443, host, "http/1.1", uid, path, "XHTTP-Temp")
-                    atomic(output, (link + "\n").encode())
-                    if relay:
-                        publish_carriers("temp", [xhttp_carrier(host, 443, host, "http/1.1",
-                                                               uid, path, "XHTTP-Temp")])
-                    print(link, flush=True)
-        while proc.stdout.read(4096):
-            pass
+        for host in tunnel_hosts(proc.stdout):
+            link = xhttp_link(host, 443, host, "http/1.1", uid, path, "XHTTP-Temp")
+            atomic(output, (link + "\n").encode())
+            if relay:
+                publish_carriers("temp", [xhttp_carrier(host, 443, host, "http/1.1",
+                                                       uid, path, "XHTTP-Temp")])
+            print(link, flush=True)
         if proc.wait():
             raise ValueError("临时隧道已中断，重新运行可申请新域名")
     finally:
         proc.terminate()
         proc.wait()
+        proc.stdout.close()
         output.unlink(missing_ok=True)
         if relay:
             publish_carriers("temp", [])
@@ -1563,7 +1613,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-c5a1aec765188585330c602480ffb8e001d1c6aed68b730ed68f91bb8e5946ea  install.py
+e62fda528113452761722f6b2d2df2ffba51326639406c44cdb17fc3e7e64956  install.py
 3dbd1008e62b2a9b24defda01e1605c6be327625082bccf2ec5b99829031d5f2  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
