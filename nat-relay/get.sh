@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Pin the artifact and its digest together when publishing a new version.
-url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/082c86d327b01b5224d8dadc81365f717a6466b4/nat-relay/nat-relay.sh'
-digest='052d3723d9ffadf776157e01d9afb7aebb84c72fed8bb4dbf3cd50e1ac8e58ef'
+url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/f82b35f0e2eed2a54f66e4561cae1cd41c5cbe88/nat-relay/nat-relay.sh'
+digest='f7d56b611b7a95d142292dc0ea7f09c60bd2ef76d181545e56e28d363396df56'
 
 download() {
     local target="$HOME/nat-relay.sh"
@@ -22,12 +22,13 @@ download() {
         return 1
     }
     mv -fT -- "$stage" "$target"
+    trap - EXIT
     printf '已校验并保存到 %s\n' "$target"
     if [[ ${1:-} == --download-only ]]; then return 0; fi
     if [[ ! -t 0 ]] && ( : </dev/tty ) 2>/dev/null; then
-        bash "$target" "$@" </dev/tty
+        exec bash "$target" "$@" </dev/tty
     else
-        bash "$target" "$@"
+        exec bash "$target" "$@"
     fi
 }
 
