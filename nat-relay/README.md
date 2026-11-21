@@ -1,5 +1,17 @@
 # 低内存 NAT VPS 的 sing-box 和 Xray 安装器
 
+## HTTPS 443 出站接入
+
+使用 ngrok 控制台分配的开发域名，在 VPS 的交互终端运行以下命令。确认本机回环端口 `8001` 空闲，也可以指定其他未占用的端口。安装器会隐藏输入 authtoken，验证公网 HTTPS 和 WebSocket 后输出 VLESS 链接。
+
+```bash
+sudo bash nat-relay.sh --https-edge your-domain.ngrok-free.dev --origin-port 8001
+```
+
+客户端连接公网域名的 HTTPS/TCP 443。VPS 上的 ngrok 代理通过出站 TCP 443 建立隧道，并转发至仅监听回环地址的 Xray。VLESS Encryption 保护网关到客户端之间的代理负载，导入链接时使用支持该功能的 Xray 内核。此模式拒绝 UDP 转发，DNS 查询和 ngrok 域名解析仍取决于各设备的解析器设置。VPS 面板无需配置入站端口转发。部署后可通过 `systemctl status nat-relay-ngrok nat-relay-wss` 检查两项服务。
+
+VPS 需要能访问 ngrok 的出站 TCP 443，客户端也需要能访问所分配的 HTTPS 域名。免费套餐有流量额度。[ngrok 出站连接说明](https://ngrok.com/docs/gateway/site-to-site-connectivity/end-customers) · [套餐额度](https://ngrok.com/docs/pricing-limits)
+
 ## 单文件安装
 
 若使用面板的 TCP 端口转发，可以用 XHTTP/HTTP2 直连。请将示例域名、外部和内部 TCP 端口换成面板的实际值。入口域名应解析到面板的公网 IPv4。`--host` 也支持公网 IPv4，原参数 `--ip` 仍可用。两端端口相同可以只填一个数字，分隔符支持 `:` 和 `：`。
