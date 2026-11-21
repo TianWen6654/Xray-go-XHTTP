@@ -7,9 +7,10 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh                 自动配置 Snell 6 和临时 XHTTP，只问 TCP 端口
   sudo bash nat-relay.sh --menu          选择其他部署模式
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
+  bash nat-relay.sh --check-egress       测试 HTTPS 隧道的出站 TCP 端口，无需 root
   sudo bash nat-relay.sh --host 公网域名或IPv4 --snell 公网端口:内部端口
   sudo bash nat-relay.sh --host 公网域名或IPv4 --xhttp-tcp 公网端口:内部端口
-  sudo bash nat-relay.sh --https-edge NGROK_DOMAIN --origin-port 8001
+  sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 安装时默认启用 --multipath。只有一个载体时也能测试连通性。
@@ -26,6 +27,7 @@ action=install
 case "${1:-}" in
     --check) action=check; shift ;;
     --options) action=options; shift ;;
+    --check-egress) action=egress; shift ;;
 esac
 if [[ $action != install && $# -ne 0 ]]; then fail '该模式不接受其他参数'; fi
 
@@ -449,7 +451,7 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
     name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
             "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-tcp.service": "natr-xhttp",
             "nat-relay-xhttp-temp.service": "natr-temp", "nat-relay-wss.service": "natr-wss",
-            "nat-relay-ngrok.service": "natr-ngrok"}[unit]
+            "nat-relay-ngrok.service": "natr-ngrok", "nat-relay-cloudflared.service": "natr-cf"}[unit]
     gid = service_gid(name)
     directory = UNIT_DATA / name
     for folder in (UNIT_DATA, directory):
@@ -483,9 +485,10 @@ def activate(binary, server, path, unit_path, arguments="run -c %d/config.json",
         raise ValueError(f"已有其他服务使用 {unit_path}")
     old = path.read_bytes() if path.exists() else None
     old_unit = unit_path.read_bytes() if unit_path.exists() else None
-    ports = (inbound.get("listen_port", inbound.get("port", 0)) for inbound in server.get("inbounds", []))
+    inbounds = server.get("inbounds", []) if isinstance(server, dict) else []
+    ports = (inbound.get("listen_port", inbound.get("port", 0)) for inbound in inbounds)
     capabilities = "CAP_NET_BIND_SERVICE" if any(0 < port < 1024 for port in ports) else ""
-    encoded = dump(server).encode()
+    encoded = server if isinstance(server, bytes) else dump(server).encode()
     installing = False
     try:
         with service_access(unit_path.name, path, encoded, credentials or {}) as (props, directory):
@@ -928,7 +931,74 @@ def edge_config(host, port, token):
     }
 
 
-def verify_websocket(host, path):
+def check_edge_egress():
+    checks = (
+        ("ngrok", "connect.ngrok-agent.com", 443),
+        ("ngrok HTTPS CRL", "crl.ngrok-agent.com", 443),
+        ("Cloudflare 区域 1", "region1.v2.argotunnel.com", 7844),
+        ("Cloudflare 区域 2", "region2.v2.argotunnel.com", 7844),
+    )
+    for label, host, port in checks:
+        try:
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as error:
+            print(f"{label} {host}:{port} DNS 查询失败（{error}）", flush=True)
+            continue
+        # Try one address per family so a failed port does not stall the whole check.
+        tested = set()
+        failures = []
+        for family, kind, protocol, _, address in sorted(addresses, key=lambda r: r[0] != socket.AF_INET):
+            if family in tested:
+                continue
+            tested.add(family)
+            try:
+                with socket.socket(family, kind, protocol) as probe:
+                    probe.settimeout(3)
+                    probe.connect(address)
+            except OSError as error:
+                failures.append(f"{address[0]} {error.strerror or str(error)}")
+                continue
+            print(f"{label} {host}:{port} TCP 可达（{address[0]}）", flush=True)
+            break
+        else:
+            print(f"{label} {host}:{port} TCP 未连通（{'；'.join(failures)}）", flush=True)
+
+
+def cloudflared_binary():
+    import platform
+    from urllib.request import urlopen
+
+    managed = Path("/usr/local/lib/nat-relay/cloudflared")
+    for path in (shutil.which("cloudflared"), managed if managed.is_file() else None):
+        if path:
+            result = subprocess.run([path, "tunnel", "run", "--help"], capture_output=True, text=True)
+            if result.returncode == 0 and "--token-file" in result.stdout:
+                return path
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if not arch:
+        raise ValueError("此架构请先安装支持 --token-file 的官方 cloudflared")
+    with urlopen("https://api.github.com/repos/cloudflare/cloudflared/releases/latest", timeout=20) as response:
+        release = json.load(response)
+    asset = next((a for a in release["assets"] if a["name"] == f"cloudflared-linux-{arch}"), {})
+    digest = asset.get("digest") or ""
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+        raise ValueError("cloudflared 官方发行清单缺少 SHA-256，请先安装官方代理程序")
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=managed.parent) as tmp:
+        staged = Path(tmp) / "cloudflared"
+        sha = hashlib.sha256()
+        with urlopen(asset["browser_download_url"], timeout=45) as response, staged.open("wb") as f:
+            while chunk := response.read(128 * 1024):
+                sha.update(chunk)
+                f.write(chunk)
+        if "sha256:" + sha.hexdigest() != digest:
+            raise ValueError("cloudflared 下载文件的 SHA-256 校验失败")
+        staged.chmod(0o755)
+        os.replace(staged, managed)
+    return managed
+
+
+def verify_websocket(host, path, unit):
     import http.client
     import ssl
 
@@ -954,7 +1024,7 @@ def verify_websocket(host, path):
         finally:
             conn.close()
         time.sleep(2)
-    raise ValueError(f"{host}:443 的 WebSocket 握手未就绪（{reason}）。请查看 journalctl -u nat-relay-ngrok.service -n 25。")
+    raise ValueError(f"{host}:443 的 WebSocket 握手未就绪（{reason}）。请查看 journalctl -u {unit} -n 25。")
 
 
 def deploy_https_edge(a):
@@ -963,21 +1033,43 @@ def deploy_https_edge(a):
 
     if os.geteuid() or not RUNTIME_UNITS.is_dir():
         raise ValueError("请在使用 systemd 的 Debian/Ubuntu VPS 上以 root 运行")
+    uses_ngrok = a.edge_provider == "ngrok"
+    label = "ngrok authtoken" if uses_ngrok else "Cloudflare Tunnel token"
     if not sys.stdin.isatty():
-        raise ValueError("请在 VPS 交互终端运行，以便隐藏输入 ngrok authtoken")
+        raise ValueError(f"请在 VPS 交互终端运行，以便隐藏输入 {label}")
     # getpass's fallback echoes input on unusual terminals. Fail closed there.
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
         try:
-            token = getpass.getpass("ngrok authtoken（输入隐藏）：").strip()
+            token = getpass.getpass(f"{label}（输入隐藏）：").strip()
         except (getpass.GetPassWarning, EOFError):
             raise ValueError("当前终端无法隐藏输入，请通过 SSH 或 VPS 的交互终端运行") from None
-    if not re.fullmatch(r"[A-Za-z0-9_-]{15,256}", token):
-        raise ValueError("ngrok authtoken 格式有误，请从自己的 ngrok 控制台复制")
+    token_pattern = r"[A-Za-z0-9_-]{15,256}" if uses_ngrok else r"[A-Za-z0-9_+=/.-]{30,4096}"
+    if not re.fullmatch(token_pattern, token):
+        raise ValueError(f"{label} 格式有误，请从对应控制台复制令牌")
     ROOT.mkdir(mode=0o700, exist_ok=True)
     with (ROOT / "install.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        agent, xray = ngrok_binary(), xray_binary()
+        origin = ROOT / "wss.json"
+        if a.origin_port == 0:
+            if origin.is_file():
+                a.origin_port = json.loads(origin.read_text())["inbounds"][0]["port"]
+            else:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    a.origin_port = probe.getsockname()[1]
+        print(f"Xray 本地回源使用 127.0.0.1:{a.origin_port}。", flush=True)
+        xray = xray_binary()
+        if uses_ngrok:
+            agent = ngrok_binary()
+            edge = edge_config(a.https_edge, a.origin_port, token)
+            filename, unit = "ngrok.json", "nat-relay-ngrok.service"
+            agent_args = 'start --all --config "%d/config.json"'
+        else:
+            agent = cloudflared_binary()
+            edge = (token + "\n").encode("ascii")
+            filename, unit = "cloudflared-token", "nat-relay-cloudflared.service"
+            agent_args = 'tunnel --no-autoupdate --protocol http2 run --token-file "%d/config.json"'
         identity = ROOT / "wss-identity.json"
         if identity.exists():
             keys = json.loads(identity.read_text())
@@ -995,20 +1087,19 @@ def deploy_https_edge(a):
                                       "wsSettings": {"path": keys["path"]}}}
         server = xray_config([inbound], a.exit_doh)
         server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
-        edge = edge_config(a.https_edge, a.origin_port, token)
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
             draft = Path(tmp) / "check.json"
             atomic(draft, dump(server).encode())
             run(xray, "run", "-test", "-c", draft)
-            atomic(draft, dump(edge).encode())
-            check = subprocess.run([agent, "config", "check", "--config", draft], capture_output=True)
-            if check.returncode:
-                raise ValueError("ngrok 配置检查失败，请确认代理程序是 3.39.7 或更新的 3.x 版本")
-        activate(xray, server, ROOT / "wss.json", UNIT.with_name("nat-relay-wss.service"), reuse_active=True)
-        activate(agent, edge, ROOT / "ngrok.json", UNIT.with_name("nat-relay-ngrok.service"),
-                 arguments='start --all --config "%d/config.json"', reuse_active=True)
+            if uses_ngrok:
+                atomic(draft, dump(edge).encode())
+                check = subprocess.run([agent, "config", "check", "--config", draft], capture_output=True)
+                if check.returncode:
+                    raise ValueError("ngrok 配置检查失败，请确认代理程序是 3.39.7 或更新的 3.x 版本")
+        activate(xray, server, origin, UNIT.with_name("nat-relay-wss.service"), reuse_active=True)
+        activate(agent, edge, ROOT / filename, UNIT.with_name(unit), arguments=agent_args, reuse_active=True)
         print(f"正在验证 {a.https_edge}:443 的 HTTPS 和 WebSocket 握手。", flush=True)
-        verify_websocket(a.https_edge, keys["path"])
+        verify_websocket(a.https_edge, keys["path"], unit)
         params = urlencode(dict(type="ws", security="tls", encryption=keys["encrypt"],
                                 host=a.https_edge, sni=a.https_edge, alpn="http/1.1", path=keys["path"]))
         link = f"vless://{keys['uuid']}@{a.https_edge}:443?{params}#HTTPS-Edge"
@@ -1112,20 +1203,30 @@ def main():
         p.add_argument(flag, type=mapping, metavar="PUBLIC:LOCAL")
     p.add_argument("--xhttp-tcp", type=mapping, metavar="PUBLIC:LOCAL", help="通过 NAT 映射提供 XHTTP/HTTP2，支持自动签发并固定本地证书")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
-    p.add_argument("--https-edge", type=domain, metavar="NGROK_DOMAIN", help="出站 TCP 443 隧道，提供加密 VLESS WebSocket")
-    p.add_argument("--origin-port", default=8001, type=int, help="临时隧道的 VPS 回环 TCP 端口")
+    p.add_argument("--https-edge", type=domain, metavar="DOMAIN", help="由 HTTPS 入口提供加密 VLESS WebSocket")
+    p.add_argument("--edge-provider", choices=("ngrok", "cloudflare"), default="ngrok", help="出站连接器，ngrok 用 TCP 443，Cloudflare 用 TCP 7844")
+    p.add_argument("--check-egress", action="store_true", help="仅探测 VPS 到 HTTPS 隧道网关的出站 TCP 连通性")
+    p.add_argument("--origin-port", default=8001, type=int, help="隧道的 VPS 回环 TCP 端口；ngrok 可填 0 自动选择")
     p.add_argument("--cdn", action="store_true", help="使用已有同域名 WebSocket CDN")
     p.add_argument("--relay-v1", "--multipath", action="store_true", help="启用兼容 NRP/1 的多路径适配器")
     p.add_argument("--edge-port", type=int, default=443)
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.check_egress:
+        if any((a.https_edge, a.auto, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp, a.xhttp_temp)):
+            p.error("--check-egress 单独运行")
+        check_edge_egress()
+        return
     if a.https_edge:
+        auto_port = a.edge_provider == "ngrok" and a.origin_port == 0
         if any((a.auto, a.ip, a.name, a.cert, a.key, a.tcp, a.udp, a.snell, a.xhttp_h3,
-                a.xhttp_tcp, a.xhttp_temp, a.cdn)) or not 1024 <= a.origin_port <= 65535:
-            p.error("--https-edge 单独部署，回环端口必须在 1024–65535")
+                a.xhttp_tcp, a.xhttp_temp, a.cdn)) or not (auto_port or 1024 <= a.origin_port <= 65535):
+            p.error("--https-edge 单独部署，回环端口为 1024–65535；ngrok 可填 0 自动选择")
         deploy_https_edge(a)
         return
+    if a.edge_provider != "ngrok":
+        p.error("--edge-provider 需要 --https-edge")
     if a.auto:
         quick_setup(a)
     if a.relay_v1:
@@ -1841,7 +1942,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-3474cd490b270a48fce5207ce6942e45d367d945a931265622d8a6ea71da12f0  install.py
+4126412ea3c111a1a437c202efbfd285691c30bd46a67b81a4e386d090e41c6a  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
@@ -1854,6 +1955,10 @@ if [[ $action == check ]]; then
 fi
 if [[ $action == options ]]; then
     python3 -B "$stage/install.py" --help
+    exit 0
+fi
+if [[ $action == egress ]]; then
+    python3 -B "$stage/install.py" --check-egress
     exit 0
 fi
 read_oom_kills() {
