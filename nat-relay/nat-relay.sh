@@ -8,6 +8,7 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh --menu          选择其他部署模式
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
   sudo bash nat-relay.sh --ip IP --snell 公网端口:内部端口
+  sudo bash nat-relay.sh --ip IP --xhttp-tcp 公网端口:内部端口
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 安装时默认启用 --multipath。只有一个载体时也能测试连通性。
@@ -86,6 +87,7 @@ import argparse
 import base64
 from contextlib import contextmanager, ExitStack
 from functools import lru_cache
+from itertools import combinations
 import hashlib
 import ipaddress
 import json
@@ -173,7 +175,7 @@ def quick_setup(a):
         try:
             ports = mapping(value if ":" in value else f"{value}:{value}")
             if ports[1] in reserved:
-                raise ValueError("内部端口 18930–18933 已保留。")
+                raise ValueError("内部端口 18930–18934 已保留。")
             a.snell = ports
         except (argparse.ArgumentTypeError, ValueError) as error:
             print(error, file=sys.stderr)
@@ -426,7 +428,8 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
         yield properties, f"/run/credentials/{unit}" if temporary else "%d"
         return
     name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
-            "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-temp.service": "natr-temp"}[unit]
+            "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-tcp.service": "natr-xhttp",
+            "nat-relay-xhttp-temp.service": "natr-temp"}[unit]
     gid = service_gid(name)
     directory = UNIT_DATA / name
     for folder in (UNIT_DATA, directory):
@@ -555,27 +558,32 @@ def xray_binary():
     return str(target)
 
 
-def xhttp_inbound(tag, port, uid, path, cert=None, key=None):
+def xhttp_inbound(tag, port, uid, path, cert=None, key=None, alpn="h3"):
     stream = {"network": "xhttp", "security": "none",
               "xhttpSettings": {"mode": "packet-up", "path": path}}
     if cert:
-        stream.update(security="tls", tlsSettings={"alpn": ["h3"], "certificates": [
+        stream.update(security="tls", tlsSettings={"alpn": [alpn], "certificates": [
             {"certificate": cert.splitlines(), "key": key.splitlines()}]})
     return {"tag": tag, "port": port, "listen": "0.0.0.0" if cert else "127.0.0.1",
             "protocol": "vless", "settings": {"clients": [{"id": uid}], "decryption": "none"},
             "streamSettings": stream}
 
 
-def xhttp_link(host, port, sni, alpn, uid, path, tag):
+def xhttp_link(host, port, sni, alpn, uid, path, tag, fingerprint=None):
     params = dict(type="xhttp", encryption="none", mode="packet-up", security="tls",
                   sni=sni, alpn=alpn, path=path)
+    if fingerprint:
+        params["pcs"] = fingerprint
     return f"vless://{uid}@{host}:{port}?{urlencode(params)}#{tag}"
 
 
-def xhttp_carrier(host, port, sni, alpn, uid, path, tag):
-    return dict(name=tag, type="vless", server=str(host), port=port, uuid=uid,
-                network="xhttp", tls=True, servername=sni, alpn=[alpn],
-                **{"xhttp-opts": {"mode": "packet-up", "path": path}})
+def xhttp_carrier(host, port, sni, alpn, uid, path, tag, fingerprint=None):
+    carrier = dict(name=tag, type="vless", server=str(host), port=port, uuid=uid,
+                   network="xhttp", tls=True, servername=sni, alpn=[alpn],
+                   **{"xhttp-opts": {"mode": "packet-up", "path": path}})
+    if fingerprint:
+        carrier["fingerprint"] = fingerprint
+    return carrier
 
 
 def publish_carriers(group, proxies, bootstrap=None, exit_doh=None, announce=True):
@@ -592,7 +600,7 @@ def publish_carriers(group, proxies, bootstrap=None, exit_doh=None, announce=Tru
             data["bootstrap"] = str(bootstrap)
             data["exit_doh"] = str(exit_doh)
         atomic(state, dump(data).encode())
-        nodes = [p for kind in ("singbox", "h3", "temp") for p in data.get(kind, [])]
+        nodes = [p for kind in ("singbox", "h3", "xhttp-tcp", "temp") for p in data.get(kind, [])]
         target = ROOT / "relay-carriers.yaml"
         bundle = ROOT / "relay-node.json"
         if not nodes:
@@ -614,17 +622,21 @@ def publish_carriers(group, proxies, bootstrap=None, exit_doh=None, announce=Tru
                   share_link(config), sep="\n", flush=True)
 
 
-def setup_v1(keys):
-    from relay_v1 import SERVICE_PORT
-    directory = ROOT / "nrp-tls"
+def local_tls_pair(directory, name):
     if not directory.exists():
         with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
             pair = Path(tmp) / "tls"
             pair.mkdir(mode=0o700)
             run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-                "-nodes", "-days", "730", "-subj", "/CN=nrp.invalid", "-addext",
-                "subjectAltName=DNS:nrp.invalid", "-keyout", pair / "key.pem", "-out", pair / "cert.pem")
+                "-nodes", "-days", "730", "-subj", f"/CN={name}", "-addext",
+                f"subjectAltName=DNS:{name}", "-keyout", pair / "key.pem", "-out", pair / "cert.pem")
             os.replace(pair, directory)
+
+
+def setup_v1(keys):
+    from relay_v1 import SERVICE_PORT
+    directory = ROOT / "nrp-tls"
+    local_tls_pair(directory, "nrp.invalid")
     source = Path(__file__).with_name("relay_v1.py")
     program = Path("/usr/local/lib/nat-relay/relay_v1.py")
     program.parent.mkdir(parents=True, exist_ok=True)
@@ -647,7 +659,7 @@ def setup_v1(keys):
 
 def enable_carrier(server, kind, password):
     from relay_v1 import SERVICE_PORT, EGRESS
-    socks_port = dict(singbox=EGRESS[0], h3=EGRESS[1], temp=EGRESS[2])[kind]
+    socks_port = dict(zip(("singbox", "h3", "temp", "xhttp-tcp"), EGRESS))[kind]
     if kind == "singbox":
         tags = []
         for i, inbound in enumerate(server["inbounds"]):
@@ -805,6 +817,35 @@ def temporary_xhttp(binary, port, doh, password=None):
                 tunnel(port, uid, path, bool(password))
 
 
+def direct_xhttp(binary, a, keys, kind, ports, cert, key):
+    alpn, name, fingerprint = ("h2" if kind == "xhttp-tcp" else "h3"), a.name, None
+    if not cert:
+        name = "xhttp.nrp.invalid"
+        directory = ROOT / "xhttp-tcp-tls"
+        local_tls_pair(directory, name)
+        cert = (directory / "cert.pem").read_text()
+        key = (directory / "key.pem").read_text()
+        fingerprint = hashlib.sha256(base64.b64decode("".join(cert.splitlines()[1:-1]), validate=True)).hexdigest()
+    public, local = ports
+    uid, path = keys["uuid"], keys["path"] + ("-h2" if alpn == "h2" else "-h3")
+    server = xray_config([xhttp_inbound(kind, local, uid, path, cert, key, alpn)], a.exit_doh)
+    if a.relay_v1:
+        enable_carrier(server, kind, keys["nrp_egress"])
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        draft = Path(tmp) / "check.json"
+        atomic(draft, dump(server).encode())
+        run(binary, "run", "-test", "-c", draft)
+    unit = "nat-relay-xhttp-tcp.service" if alpn == "h2" else "nat-relay-xray.service"
+    config = "xhttp-tcp.json" if alpn == "h2" else "xray.json"
+    activate(binary, server, ROOT / config, UNIT.with_name(unit))
+    tag = "XHTTP-TCP" if alpn == "h2" else "XHTTP-H3"
+    args = (a.ip, public, name, alpn, uid, path, tag, fingerprint)
+    link = xhttp_link(*args)
+    atomic(ROOT / f"{tag.lower()}.txt", (link + "\n").encode())
+    publish_carriers(kind, [xhttp_carrier(*args)] if a.relay_v1 else [], a.bootstrap_doh, a.exit_doh)
+    print(link, flush=True)
+
+
 def deploy(a):
     import fcntl
     if os.geteuid() or not Path("/run/systemd/system").is_dir():
@@ -819,9 +860,10 @@ def deploy(a):
             fcntl.flock(session, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("已有会话持有 XHTTP 锁，请回到原终端查看节点或结束该会话。") from None
-        (ROOT / "xhttp-temp.txt").unlink(missing_ok=True)
+        if a.xhttp_temp:
+            (ROOT / "xhttp-temp.txt").unlink(missing_ok=True)
     cert = key = None
-    if a.udp or a.tcp or a.xhttp_h3:
+    if a.udp or a.tcp or a.xhttp_h3 or (a.xhttp_tcp and a.cert):
         import ssl
 
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -873,25 +915,11 @@ def deploy(a):
         print(*links, sep="\n", flush=True)
         if a.xhttp_temp:
             print("等待临时 XHTTP 域名。分配成功后将在这里输出含 XHTTP 的合并节点，请保持终端打开。", flush=True)
-    if a.xhttp_temp or a.xhttp_h3:
+    if a.xhttp_temp or a.xhttp_h3 or a.xhttp_tcp:
         binary = xray_binary()
-    if a.xhttp_h3:
-        path = keys["path"] + "-h3"
-        inbound = xhttp_inbound("h3", a.xhttp_h3[1], keys["uuid"], path, cert, key)
-        server = xray_config([inbound], a.exit_doh)
-        if a.relay_v1:
-            enable_carrier(server, "h3", keys["nrp_egress"])
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            draft = Path(tmp) / "check.json"
-            draft.write_text(dump(server))
-            run(binary, "run", "-test", "-c", draft)
-        activate(binary, server, ROOT / "xray.json", UNIT.with_name("nat-relay-xray.service"))
-        h3 = ROOT / "xhttp-h3.txt"
-        link = xhttp_link(a.ip, a.xhttp_h3[0], a.name, "h3", keys["uuid"], path, "XHTTP-H3")
-        atomic(h3, (link + "\n").encode())
-        carriers = [xhttp_carrier(a.ip, a.xhttp_h3[0], a.name, "h3", keys["uuid"], path, "XHTTP-H3")]
-        publish_carriers("h3", carriers if a.relay_v1 else [], a.bootstrap_doh, a.exit_doh)
-        print(link, flush=True)
+        for kind, ports in (("h3", a.xhttp_h3), ("xhttp-tcp", a.xhttp_tcp)):
+            if ports:
+                direct_xhttp(binary, a, keys, kind, ports, cert, key)
     lock.close()
     if a.xhttp_temp:
         def end_session(signum, frame):
@@ -912,6 +940,7 @@ def main():
     p.add_argument("--key", type=Path, help="对应的 PEM 私钥")
     for flag in ("--tcp", "--udp", "--snell", "--xhttp-h3"):
         p.add_argument(flag, type=mapping, metavar="PUBLIC:LOCAL")
+    p.add_argument("--xhttp-tcp", type=mapping, metavar="PUBLIC:LOCAL", help="通过 NAT 映射提供 XHTTP/HTTP2，支持自动签发并固定本地证书")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
     p.add_argument("--origin-port", default=8001, type=int, help="临时隧道的 VPS 回环 TCP 端口")
     p.add_argument("--cdn", action="store_true", help="使用已有同域名 WebSocket CDN")
@@ -926,24 +955,26 @@ def main():
         if not all(Path(__file__).with_name(n).is_file() for n in ("relay_v1.py", "multipath.py")):
             p.error("请把 relay_v1.py、multipath.py 与 install.py 放在同一目录")
         from relay_v1 import SERVICE_PORT, EGRESS
-        local = [m[1] for m in (a.tcp, a.snell) if m]
+        local = [m[1] for m in (a.tcp, a.snell, a.xhttp_tcp) if m]
         if a.xhttp_temp:
             local.append(a.origin_port)
         if set(local).intersection((SERVICE_PORT, *EGRESS)):
-            p.error("NRP/1 保留 18930–18933 作为本地 TCP 端口")
+            p.error("NRP 保留 18930–18934 作为本地 TCP 端口")
     direct = a.tcp or a.udp or a.xhttp_h3
-    if not (direct or a.snell or a.xhttp_temp):
+    if not (direct or a.snell or a.xhttp_temp or a.xhttp_tcp):
         p.error("请指定一种入站或 --xhttp-temp")
-    if (direct or a.snell) and not a.ip:
+    if (direct or a.snell or a.xhttp_tcp) and not a.ip:
         a.ip = discover_ipv4()
-    if direct and not (a.name and a.cert and a.key):
+    if (direct or (a.xhttp_tcp and (a.name or a.cert or a.key))) and not (a.name and a.cert and a.key):
         p.error("直连 TLS 入站需要 --name、--cert 和 --key")
     if (a.cdn and not a.tcp) or not all(1 <= i <= 65535 for i in [a.edge_port, a.origin_port]):
         p.error("CDN 需要 --tcp；端口范围为 1–65535")
-    for group in ((a.tcp, a.snell), (a.udp, a.xhttp_h3)):
-        if all(group) and any(x == y for x, y in zip(*group)):
-            p.error("同一传输协议的两个服务不能共用公网端口或内部端口")
-    if a.xhttp_temp and any(m and m[1] == a.origin_port for m in (a.tcp, a.snell)):
+    tcp = (a.tcp, a.snell, a.xhttp_tcp)
+    for group in (tcp, (a.udp, a.xhttp_h3)):
+        for left, right in combinations((m for m in group if m), 2):
+            if any(x == y for x, y in zip(left, right)):
+                p.error("同一传输协议的两个服务不能共用公网端口或内部端口")
+    if a.xhttp_temp and any(m and m[1] == a.origin_port for m in tcp):
         p.error("回源端口与其他 TCP 服务冲突")
     deploy(a)
 
@@ -973,7 +1004,7 @@ from pathlib import Path
 
 MAGIC = b"NRP\x01"
 SERVICE_PORT = 18930
-EGRESS = (18931, 18932, 18933)
+EGRESS = (18931, 18932, 18933, 18934)
 LIMIT = 32
 TIMEOUT = 12
 
@@ -1005,11 +1036,13 @@ def import_link(link):
                 raise ValueError
             ipaddress.IPv4Address(url[8:-len(suffix)])
         allowed = {"name","type","server","port","udp","version","psk","password","sni",
-                   "uuid","network","tls","servername","alpn","ws-opts","xhttp-opts"}
+                   "uuid","network","tls","servername","alpn","ws-opts","xhttp-opts","fingerprint"}
         for node in nodes:
             if node["type"] not in ("vless","snell","hysteria2") or set(node) - allowed:
                 raise ValueError
             if not isinstance(node["port"], int) or not 1 <= node["port"] <= 65535:
+                raise ValueError
+            if "fingerprint" in node and not re.fullmatch(r"[0-9a-fA-F]{64}", node["fingerprint"]):
                 raise ValueError
             if set(node.get("ws-opts", {})) - {"path","headers"} or set(node.get("xhttp-opts", {})) - {"mode","path"}:
                 raise ValueError
@@ -1629,8 +1662,8 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-088e1ce6d2f34b9a37c7516849a7cd832279200b45167415ebb707eeac7e6d05  install.py
-e5844ecdd58e984970df2b29af61bb7dfc9cd357f45ec140ea2993068cf1758d  relay_v1.py
+08071c38673dd9ec3da4c6d2e103930db2e0ae64f61b47a54eb5d3f28a87b310  install.py
+f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
