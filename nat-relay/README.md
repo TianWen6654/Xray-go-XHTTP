@@ -2,6 +2,14 @@
 
 ## 单文件安装
 
+若使用面板的 TCP 端口转发，可以用 XHTTP/HTTP2 直连。请将示例公网 IP、外部和内部 TCP 端口换成面板的实际值。
+
+```bash
+sudo bash nat-relay.sh --ip 203.0.113.10 --xhttp-tcp 23456:8001
+```
+
+脚本默认生成本机 TLS 证书，并把 SHA-256 指纹写入 VLESS 链接的 `pcs` 和 Mihomo 节点的 `fingerprint`。导入时使用支持相应字段的客户端。使用 NRP 合并链接时需更新本目录的 `relay_v1.py`。如需使用自己的证书，可以传入 `--name`、`--cert` 和 `--key`。同时使用 Snell 时，为它分配单独的 TCP 映射。
+
 在使用 systemd 的 Debian 12+ 或 Ubuntu 22.04+ VPS 网页终端中以 root 运行以下命令。下载器核对 SHA-256 后保存为 `$HOME/nat-relay.sh`。默认只问一个 TCP 端口。例如转发为 `10880 → 10880` 时填 `10880`，两端不同时填 `公网端口:内部端口`。
 
 ```bash
