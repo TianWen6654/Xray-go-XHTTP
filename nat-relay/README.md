@@ -12,6 +12,16 @@ sudo bash nat-relay.sh --nat-web nat.example.com --public-ports 10880,10881 --li
 
 部署结果包含网页地址和 `vless://…#NAT-HTTPS` 链接。公网映射使用所选端口，服务监听 `--listen-port` 指定的内部端口。Caddy 提供 HTTPS 网页和 WebSocket 反代，Xray 只监听回环，拒绝 UDP 转发。此模式不经过 CDN，不申请隧道域名，也不启用 HTTP/3。需要具有面板映射权限的用户建立或保留转发规则。证书更新后应同步更新 Caddy 服务配置。
 
+### 更换公网端口
+
+已部署 NAT HTTPS 时，把面板分配的新候选公网 TCP 端口转发到原来的 VPS 内部端口。旧映射可先保留。
+
+```bash
+sudo bash nat-relay.sh --switch-web-port --public-ports 10881,10882
+```
+
+运行 VPS 输出的 PowerShell 命令。它会验证各端口的 TLS 和现有 WebSocket 握手。把一个 `Verified` 端口填回 VPS，脚本将重新输出节点链接。换端口保留域名、证书、UUID 和内部端口，服务继续运行。导入并验证新链接后，可从面板移除旧映射。
+
 ## HTTPS 443 接入
 
 在 VPS 上运行 `bash nat-relay.sh --check-egress` 可探测 ngrok 的 TCP 443 和 Cloudflare 的 TCP 7844。这个命令只发起 DNS 查询和 TCP 握手。面板的常规入站端口映射与出站访问权限独立。若服务商还限制出站，需要在上游开通所选连接器的目标端口。
