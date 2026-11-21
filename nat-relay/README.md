@@ -2,6 +2,8 @@
 
 ## NAT 直连 HTTPS 与端口预检
 
+先在实际使用的 Windows 客户端运行 `Test-NatRelayTcp.ps1 -HostName 域名`，按提示输入面板分配给这台 VPS 的全部候选公网 TCP 端口。脚本会列出当前能完成 TCP 握手的端口。共享入口的 TCP 握手可能来自其他服务，未建立映射或未启动服务的端口也可能超时。下一阶段通过本 VPS 的 HTTPS 验证码确认实际转发。[Windows 探测脚本](./Test-NatRelayTcp.ps1)
+
 准备解析到服务商公网入口的域名。安装器默认读取 `/etc/letsencrypt/live/域名/fullchain.pem` 和 `privkey.pem`，也可用 `--cert` 和 `--key` 指定文件。如果本机没有证书，脚本自动生成 30 天的临时证书。探测核对公钥指纹，节点链接携带 `pcs` 证书指纹，需使用支持该字段的 Xray 客户端。普通浏览器仍会提示临时证书未受信任。只有高位公网端口时，可以通过 DNS-01 签发公开受信任证书。
 
 ```bash
