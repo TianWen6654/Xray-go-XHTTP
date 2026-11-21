@@ -12,7 +12,7 @@ from pathlib import Path
 
 MAGIC = b"NRP\x01"
 SERVICE_PORT = 18930
-EGRESS = (18931, 18932, 18933)
+EGRESS = (18931, 18932, 18933, 18934)
 LIMIT = 32
 TIMEOUT = 12
 
@@ -44,11 +44,13 @@ def import_link(link):
                 raise ValueError
             ipaddress.IPv4Address(url[8:-len(suffix)])
         allowed = {"name","type","server","port","udp","version","psk","password","sni",
-                   "uuid","network","tls","servername","alpn","ws-opts","xhttp-opts"}
+                   "uuid","network","tls","servername","alpn","ws-opts","xhttp-opts","fingerprint"}
         for node in nodes:
             if node["type"] not in ("vless","snell","hysteria2") or set(node) - allowed:
                 raise ValueError
             if not isinstance(node["port"], int) or not 1 <= node["port"] <= 65535:
+                raise ValueError
+            if "fingerprint" in node and not re.fullmatch(r"[0-9a-fA-F]{64}", node["fingerprint"]):
                 raise ValueError
             if set(node.get("ws-opts", {})) - {"path","headers"} or set(node.get("xhttp-opts", {})) - {"mode","path"}:
                 raise ValueError
