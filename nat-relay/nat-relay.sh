@@ -110,6 +110,10 @@ UNIT = Path("/etc/systemd/system/nat-relay.service")
 UNIT_MARK = "# Managed by nat-relay/install.py\n"
 UNIT_DATA = Path("/etc/nat-relay-unit-data")
 RUNTIME_UNITS = Path("/run/systemd/system")
+# Verified against the SHA-256 fingerprint at https://localhost.run/docs/security.
+TUNNEL_HOST_KEY = (
+    "localhost.run ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILVqOuSMnyeGDVO1lG6EaG5In/dXABCchhmHKkuRU2s9\n"
+)
 
 
 def run(*cmd, **kwargs):
@@ -718,6 +722,8 @@ def tunnel_hosts(stream, timeout=60):
                 if host and current != host:
                     current = host
                     yield host
+                elif current is None and line == "Host key verification failed.":
+                    raise ValueError("localhost.run 主机密钥校验失败，请核对官方公布的 ED25519 指纹。")
                 elif current is None and (line.startswith(("ssh:", "Error: remote port forwarding failed"))
                                           or "Permission denied (" in line):
                     raise ValueError(f"SSH 转发失败：{line[:300]}")
@@ -731,19 +737,8 @@ def tunnel_hosts(stream, timeout=60):
 
 
 def tunnel(port, uid, path, relay=False):
-    # The edge host key is published at https://localhost.run/docs/security.
-    scan = run("ssh-keyscan", "-T", "10", "-t", "ed25519", "localhost.run",
-               stdout=subprocess.PIPE, text=True)
     keyfile = ROOT / "tunnel-known-hosts"
-    for line in scan.stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 3 and fields[:2] == ["localhost.run", "ssh-ed25519"]:
-            fp = base64.b64encode(hashlib.sha256(base64.b64decode(fields[2])).digest())
-            if fp.rstrip(b"=") == b"pG6qrBxubYfWa1Zadu/V0NUgjEDiBds/7e2xzte/QNM":
-                atomic(keyfile, (line + "\n").encode())
-                break
-    else:
-        raise ValueError("隧道网关主机密钥不匹配，请对照官方公布的指纹")
+    atomic(keyfile, TUNNEL_HOST_KEY.encode("ascii"))
     command = ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={keyfile}",
                "-o", "GlobalKnownHostsFile=/dev/null", "-o", "HostKeyAlgorithms=ssh-ed25519",
@@ -787,7 +782,7 @@ def xray_config(inbounds, doh):
 
 
 def temporary_xhttp(binary, port, doh, password=None):
-    if not all(shutil.which(cmd) for cmd in ("ssh", "ssh-keyscan")):
+    if not shutil.which("ssh"):
         run("apt-get", "update")
         run("apt-get", "install", "-y", "--no-install-recommends", "openssh-client")
     uid, path = str(uuid.uuid4()), "/x-" + secrets.token_hex(12)
@@ -1634,7 +1629,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-2f9bfe5c9736c740b636c83dd68ddf439a4925fe191e7c627d3f3424af434a8a  install.py
+088e1ce6d2f34b9a37c7516849a7cd832279200b45167415ebb707eeac7e6d05  install.py
 e5844ecdd58e984970df2b29af61bb7dfc9cd357f45ec140ea2993068cf1758d  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
