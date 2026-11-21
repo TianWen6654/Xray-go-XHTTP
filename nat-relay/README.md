@@ -1,5 +1,17 @@
 # 低内存 NAT VPS 的 sing-box 和 Xray 安装器
 
+## NAT 直连 HTTPS 与端口预检
+
+准备解析到服务商公网入口的域名。安装器默认读取 `/etc/letsencrypt/live/域名/fullchain.pem` 和 `privkey.pem`，也可用 `--cert` 和 `--key` 指定文件。如果本机没有证书，脚本自动生成 30 天的临时证书。探测核对公钥指纹，节点链接携带 `pcs` 证书指纹，需使用支持该字段的 Xray 客户端。普通浏览器仍会提示临时证书未受信任。只有高位公网端口时，可以通过 DNS-01 签发公开受信任证书。
+
+```bash
+sudo bash nat-relay.sh --nat-web nat.example.com --public-ports 10880,10881 --listen-port 443
+```
+
+候选端口取自面板已分配的 TCP 端口。按 VPS 终端提示，先把候选公网端口临时映射到同一个空闲的 VPS 内部端口，面板只允许一条规则时可逐个测试。从实际使用的客户端网络运行 VPS 输出的 Windows PowerShell 探测命令，确认输出中列为 `Verified` 的端口并保留对应映射。临时 HTTPS 探测服务验证本次验证码，收到选择后停止，随后才部署 Caddy 和 Xray。
+
+部署结果包含网页地址和 `vless://…#NAT-HTTPS` 链接。公网映射使用所选端口，服务监听 `--listen-port` 指定的内部端口。Caddy 提供 HTTPS 网页和 WebSocket 反代，Xray 只监听回环，拒绝 UDP 转发。此模式不经过 CDN，不申请隧道域名，也不启用 HTTP/3。需要具有面板映射权限的用户建立或保留转发规则。证书更新后应同步更新 Caddy 服务配置。
+
 ## HTTPS 443 接入
 
 在 VPS 上运行 `bash nat-relay.sh --check-egress` 可探测 ngrok 的 TCP 443 和 Cloudflare 的 TCP 7844。这个命令只发起 DNS 查询和 TCP 握手。面板的常规入站端口映射与出站访问权限独立。若服务商还限制出站，需要在上游开通所选连接器的目标端口。
