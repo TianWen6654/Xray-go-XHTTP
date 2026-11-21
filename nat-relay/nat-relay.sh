@@ -9,6 +9,7 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
   sudo bash nat-relay.sh --host 公网域名或IPv4 --snell 公网端口:内部端口
   sudo bash nat-relay.sh --host 公网域名或IPv4 --xhttp-tcp 公网端口:内部端口
+  sudo bash nat-relay.sh --https-edge NGROK_DOMAIN --origin-port 8001
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 安装时默认启用 --multipath。只有一个载体时也能测试连通性。
@@ -105,6 +106,7 @@ import tempfile
 import time
 from urllib.parse import quote, urlencode
 import uuid
+import warnings
 
 ROOT = Path("/etc/nat-relay")
 UNIT = Path("/etc/systemd/system/nat-relay.service")
@@ -446,7 +448,8 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
         return
     name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
             "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-tcp.service": "natr-xhttp",
-            "nat-relay-xhttp-temp.service": "natr-temp"}[unit]
+            "nat-relay-xhttp-temp.service": "natr-temp", "nat-relay-wss.service": "natr-wss",
+            "nat-relay-ngrok.service": "natr-ngrok"}[unit]
     gid = service_gid(name)
     directory = UNIT_DATA / name
     for folder in (UNIT_DATA, directory):
@@ -863,6 +866,156 @@ def direct_xhttp(binary, a, keys, kind, ports, cert, key):
     print(link, flush=True)
 
 
+def ngrok_binary():
+    import platform
+    import tarfile
+    from urllib.request import urlopen
+
+    def recent(path):
+        if not path:
+            return False
+        result = subprocess.run([path, "version"], capture_output=True, text=True)
+        match = re.search(r"\b3\.(\d+)\.(\d+)\b", result.stdout)
+        return result.returncode == 0 and match is not None and tuple(map(int, match.groups())) >= (39, 7)
+
+    managed = Path("/usr/local/lib/nat-relay/ngrok")
+    for path in (shutil.which("ngrok"), managed if managed.is_file() else None):
+        if recent(path):
+            return path
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if not arch:
+        raise ValueError("此架构请先安装官方 ngrok 3.39.7 或更新的 3.x 版本")
+    url = f"https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-{arch}.tgz"
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=managed.parent) as tmp:
+        staged = Path(tmp) / "ngrok"
+        with urlopen(url, timeout=45) as response:
+            if not response.geturl().startswith("https://"):
+                raise ValueError("ngrok 官方下载降级为非 HTTPS 连接")
+            with tarfile.open(fileobj=response, mode="r|gz") as archive:
+                for member in archive:
+                    if member.isfile() and member.name in ("ngrok", "./ngrok"):
+                        with archive.extractfile(member) as src, staged.open("wb") as dst:
+                            shutil.copyfileobj(src, dst, length=128 * 1024)
+                        break
+        if not staged.is_file():
+            raise ValueError("ngrok 发行包中没有找到代理程序")
+        staged.chmod(0o755)
+        if not recent(staged):
+            raise ValueError("ngrok 代理版本不足，无法通过 HTTPS 查询证书吊销列表")
+        os.replace(staged, managed)
+    return managed
+
+
+def edge_config(host, port, token):
+    return {
+        "version": 3,
+        "agent": {
+            "authtoken": token,
+            "web_addr": "false",
+            "console_ui": False,
+            "remote_management": False,
+            "update_check": False,
+            "crl_url": "https://crl.ngrok-agent.com/ngrok.crl",
+            "log": "stdout",
+            "log_level": "warn",
+        },
+        "endpoints": [{
+            "name": "nat-relay",
+            "url": f"https://{host}",
+            "upstream": {"url": f"http://127.0.0.1:{port}", "protocol": "http1"},
+        }],
+    }
+
+
+def verify_websocket(host, path):
+    import http.client
+    import ssl
+
+    nonce = base64.b64encode(secrets.token_bytes(16)).decode()
+    expected = base64.b64encode(hashlib.sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+    for _ in range(8):
+        conn = http.client.HTTPSConnection(host, 443, timeout=3)
+        try:
+            conn.request("GET", path, headers={"Connection": "Upgrade", "Upgrade": "websocket",
+                         "Sec-WebSocket-Key": nonce, "Sec-WebSocket-Version": "13"})
+            response = conn.getresponse()
+            accepted = response.getheader("Sec-WebSocket-Accept", "").encode()
+            if response.status == 101 and secrets.compare_digest(expected, accepted):
+                return
+            reason = f"HTTP {response.status}"
+            code = response.getheader("ngrok-error-code", "")
+            if re.fullmatch(r"ERR_NGROK_\d+", code):
+                reason += " " + code
+        except ssl.SSLCertVerificationError:
+            raise ValueError(f"{host} 的公网 TLS 证书校验失败") from None
+        except (OSError, http.client.HTTPException) as exc:
+            reason = type(exc).__name__
+        finally:
+            conn.close()
+        time.sleep(2)
+    raise ValueError(f"{host}:443 的 WebSocket 握手未就绪（{reason}）。请查看 journalctl -u nat-relay-ngrok.service -n 25。")
+
+
+def deploy_https_edge(a):
+    import fcntl
+    import getpass
+
+    if os.geteuid() or not RUNTIME_UNITS.is_dir():
+        raise ValueError("请在使用 systemd 的 Debian/Ubuntu VPS 上以 root 运行")
+    if not sys.stdin.isatty():
+        raise ValueError("请在 VPS 交互终端运行，以便隐藏输入 ngrok authtoken")
+    # getpass's fallback echoes input on unusual terminals. Fail closed there.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            token = getpass.getpass("ngrok authtoken（输入隐藏）：").strip()
+        except (getpass.GetPassWarning, EOFError):
+            raise ValueError("当前终端无法隐藏输入，请通过 SSH 或 VPS 的交互终端运行") from None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{15,256}", token):
+        raise ValueError("ngrok authtoken 格式有误，请从自己的 ngrok 控制台复制")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    with (ROOT / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        agent, xray = ngrok_binary(), xray_binary()
+        identity = ROOT / "wss-identity.json"
+        if identity.exists():
+            keys = json.loads(identity.read_text())
+        else:
+            generated = run(xray, "vlessenc", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+            match = re.search(r'"decryption"\s*:\s*"([^"]+)"\s*,?\s*"encryption"\s*:\s*"([^"]+)"', generated)
+            if match is None:
+                raise ValueError("当前 Xray 缺少 VLESS Encryption，请升级 Xray-core")
+            keys = {**credentials(), "decrypt": match[1], "encrypt": match[2]}
+            atomic(identity, dump(keys).encode())
+        tag = "wss-edge"
+        inbound = {"tag": tag, "listen": "127.0.0.1", "port": a.origin_port, "protocol": "vless",
+                   "settings": {"clients": [{"id": keys["uuid"]}], "decryption": keys["decrypt"]},
+                   "streamSettings": {"network": "ws", "security": "none",
+                                      "wsSettings": {"path": keys["path"]}}}
+        server = xray_config([inbound], a.exit_doh)
+        server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
+        edge = edge_config(a.https_edge, a.origin_port, token)
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            draft = Path(tmp) / "check.json"
+            atomic(draft, dump(server).encode())
+            run(xray, "run", "-test", "-c", draft)
+            atomic(draft, dump(edge).encode())
+            check = subprocess.run([agent, "config", "check", "--config", draft], capture_output=True)
+            if check.returncode:
+                raise ValueError("ngrok 配置检查失败，请确认代理程序是 3.39.7 或更新的 3.x 版本")
+        activate(xray, server, ROOT / "wss.json", UNIT.with_name("nat-relay-wss.service"), reuse_active=True)
+        activate(agent, edge, ROOT / "ngrok.json", UNIT.with_name("nat-relay-ngrok.service"),
+                 arguments='start --all --config "%d/config.json"', reuse_active=True)
+        print(f"正在验证 {a.https_edge}:443 的 HTTPS 和 WebSocket 握手。", flush=True)
+        verify_websocket(a.https_edge, keys["path"])
+        params = urlencode(dict(type="ws", security="tls", encryption=keys["encrypt"],
+                                host=a.https_edge, sni=a.https_edge, alpn="http/1.1", path=keys["path"]))
+        link = f"vless://{keys['uuid']}@{a.https_edge}:443?{params}#HTTPS-Edge"
+        atomic(ROOT / "wss-edge.txt", (link + "\n").encode())
+        print(link, flush=True)
+
+
 def deploy(a):
     import fcntl
     if os.geteuid() or not Path("/run/systemd/system").is_dir():
@@ -959,6 +1112,7 @@ def main():
         p.add_argument(flag, type=mapping, metavar="PUBLIC:LOCAL")
     p.add_argument("--xhttp-tcp", type=mapping, metavar="PUBLIC:LOCAL", help="通过 NAT 映射提供 XHTTP/HTTP2，支持自动签发并固定本地证书")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
+    p.add_argument("--https-edge", type=domain, metavar="NGROK_DOMAIN", help="出站 TCP 443 隧道，提供加密 VLESS WebSocket")
     p.add_argument("--origin-port", default=8001, type=int, help="临时隧道的 VPS 回环 TCP 端口")
     p.add_argument("--cdn", action="store_true", help="使用已有同域名 WebSocket CDN")
     p.add_argument("--relay-v1", "--multipath", action="store_true", help="启用兼容 NRP/1 的多路径适配器")
@@ -966,6 +1120,12 @@ def main():
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.https_edge:
+        if any((a.auto, a.ip, a.name, a.cert, a.key, a.tcp, a.udp, a.snell, a.xhttp_h3,
+                a.xhttp_tcp, a.xhttp_temp, a.cdn)) or not 1024 <= a.origin_port <= 65535:
+            p.error("--https-edge 单独部署，回环端口必须在 1024–65535")
+        deploy_https_edge(a)
+        return
     if a.auto:
         quick_setup(a)
     if a.relay_v1:
@@ -1681,7 +1841,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-97a1f3303ce923c980eb5308bf766824bc62e0f07f19bb079417b0388e9bacee  install.py
+3474cd490b270a48fce5207ce6942e45d367d945a931265622d8a6ea71da12f0  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
