@@ -7,8 +7,8 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh                 自动配置 Snell 6 和临时 XHTTP，只问 TCP 端口
   sudo bash nat-relay.sh --menu          选择其他部署模式
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
-  sudo bash nat-relay.sh --ip IP --snell 公网端口:内部端口
-  sudo bash nat-relay.sh --ip IP --xhttp-tcp 公网端口:内部端口
+  sudo bash nat-relay.sh --host 公网域名或IPv4 --snell 公网端口:内部端口
+  sudo bash nat-relay.sh --host 公网域名或IPv4 --xhttp-tcp 公网端口:内部端口
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 安装时默认启用 --multipath。只有一个载体时也能测试连通性。
@@ -52,7 +52,6 @@ if [[ $action == install ]]; then
                 [[ -n $tcp ]] && break
                 printf '%s\n' '请输入端口号。'
             done
-            [[ $tcp == *:* ]] || tcp="$tcp:$tcp"
             params+=(--snell "$tcp")
         fi
         if [[ $mode == 2 ]]; then
@@ -127,13 +126,16 @@ def dump(data):
 
 
 def mapping(value):
+    parts = value.replace("：", ":").split(":")
+    if len(parts) == 1:
+        parts *= 2
     try:
-        public, local = map(int, value.split(":"))
+        public, local = map(int, parts)
         if 1 <= min(public, local) and max(public, local) <= 65535:
             return public, local
     except ValueError:
         pass
-    raise argparse.ArgumentTypeError("映射应为 公网端口:内部端口，范围 1–65535")
+    raise argparse.ArgumentTypeError("请输入端口号或 公网端口:内部端口，范围 1–65535")
 
 
 def discover_ipv4():
@@ -159,9 +161,9 @@ def discover_ipv4():
         except (OSError, UnicodeError):
             continue
         if address:
-            print(f"检测到出口 IPv4 {address}。若与面板的 NAT 入口不同，请用 --ip 指定入口。", flush=True)
+            print(f"检测到出口 IPv4 {address}。若与面板的 NAT 入口不同，请用 --host 指定入口。", flush=True)
             return address
-    raise ValueError("无法探测公网 IPv4。请用 --auto --ip 面板入口IPv4 重试。")
+    raise ValueError("无法探测公网 IPv4。请用 --host 指定面板的公网入口域名或 IPv4。")
 
 
 def quick_setup(a):
@@ -173,7 +175,7 @@ def quick_setup(a):
         except EOFError:
             raise ValueError("终端输入已关闭。可以用 --auto --snell 公网端口:内部端口。") from None
         try:
-            ports = mapping(value if ":" in value else f"{value}:{value}")
+            ports = mapping(value)
             if ports[1] in reserved:
                 raise ValueError("内部端口 18930–18934 已保留。")
             a.snell = ports
@@ -201,6 +203,21 @@ def domain(value):
     ):
         raise argparse.ArgumentTypeError("请输入 ASCII 域名或 Punycode")
     return ".".join(labels)
+
+
+def entry_host(value):
+    value = value.strip()
+    try:
+        return ipaddress.IPv4Address(value)
+    except ValueError:
+        if value.endswith("."):
+            value = value[:-1]
+        if not re.fullmatch(r"[0-9.]+", value):
+            try:
+                return domain(value)
+            except argparse.ArgumentTypeError:
+                pass
+        raise argparse.ArgumentTypeError("请填写入口域名或 IPv4，不含协议、端口或路径") from None
 
 
 def credentials():
@@ -934,7 +951,7 @@ def deploy(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--auto", action="store_true", help="仅输入 TCP 映射，自动选择临时 XHTTP 回源端口")
-    p.add_argument("--ip", type=ipaddress.IPv4Address, help="NAT 公网 IPv4")
+    p.add_argument("--host", "--ip", dest="ip", type=entry_host, help="NAT 公网入口域名或 IPv4")
     p.add_argument("--name", type=domain, help="直连 TLS 证书域名")
     p.add_argument("--cert", type=Path, help="受信任的完整证书链")
     p.add_argument("--key", type=Path, help="对应的 PEM 私钥")
@@ -965,6 +982,8 @@ def main():
         p.error("请指定一种入站或 --xhttp-temp")
     if (direct or a.snell or a.xhttp_tcp) and not a.ip:
         a.ip = discover_ipv4()
+    if a.xhttp_tcp and isinstance(a.ip, ipaddress.IPv4Address) and (not a.ip.is_global or a.ip.is_multicast):
+        p.error(f"{a.ip} 不是公网 IPv4；--host 请填写面板的公网入口域名或 IPv4")
     if (direct or (a.xhttp_tcp and (a.name or a.cert or a.key))) and not (a.name and a.cert and a.key):
         p.error("直连 TLS 入站需要 --name、--cert 和 --key")
     if (a.cdn and not a.tcp) or not all(1 <= i <= 65535 for i in [a.edge_port, a.origin_port]):
@@ -1662,7 +1681,7 @@ def carrier_process(cfg, executable, local_port):
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-08071c38673dd9ec3da4c6d2e103930db2e0ae64f61b47a54eb5d3f28a87b310  install.py
+97a1f3303ce923c980eb5308bf766824bc62e0f07f19bb079417b0388e9bacee  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 NRP_SHA256
