@@ -2,10 +2,10 @@
 
 ## 单文件安装
 
-若使用面板的 TCP 端口转发，可以用 XHTTP/HTTP2 直连。请将示例公网 IP、外部和内部 TCP 端口换成面板的实际值。
+若使用面板的 TCP 端口转发，可以用 XHTTP/HTTP2 直连。请将示例域名、外部和内部 TCP 端口换成面板的实际值。入口域名应解析到面板的公网 IPv4。`--host` 也支持公网 IPv4，原参数 `--ip` 仍可用。两端端口相同可以只填一个数字，分隔符支持 `:` 和 `：`。
 
 ```bash
-sudo bash nat-relay.sh --ip 203.0.113.10 --xhttp-tcp 23456:8001
+sudo bash nat-relay.sh --host nat.example.com --xhttp-tcp 23456:8001
 ```
 
 脚本默认生成本机 TLS 证书，并把 SHA-256 指纹写入 VLESS 链接的 `pcs` 和 Mihomo 节点的 `fingerprint`。导入时使用支持相应字段的客户端。使用 NRP 合并链接时需更新本目录的 `relay_v1.py`。如需使用自己的证书，可以传入 `--name`、`--cert` 和 `--key`。同时使用 Snell 时，为它分配单独的 TCP 映射。
