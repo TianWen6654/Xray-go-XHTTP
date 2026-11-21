@@ -11,14 +11,22 @@ param(
 
     [Parameter(Mandatory)]
     [ValidatePattern('^[a-f0-9]{32}$')]
-    [string]$Challenge
+    [string]$Challenge,
+
+    [ValidatePattern('^sha256//[A-Za-z0-9+/]{43}=$')]
+    [string]$TlsPin
 )
 
 $curl = (Get-Command curl.exe -ErrorAction Stop).Source
+$tlsArgs = @()
+if ($TlsPin) {
+    # An exact SPKI pin still authenticates the temporary TLS endpoint.
+    $tlsArgs = @('--insecure', '--pinnedpubkey', $TlsPin)
+}
 $verified = @()
 foreach ($port in ($PublicPorts | Select-Object -Unique)) {
     $url = "https://${HostName}:${port}/nat-relay/${Challenge}/probe/${port}"
-    $reply = & $curl --noproxy '*' --silent --connect-timeout 3 --max-time 5 --max-filesize 256 --fail $url
+    $reply = & $curl @tlsArgs --noproxy '*' --silent --connect-timeout 3 --max-time 5 --max-filesize 256 --fail $url
     $code = $LASTEXITCODE
     $status = switch ($code) {
         0 {
@@ -32,6 +40,7 @@ foreach ($port in ($PublicPorts | Select-Object -Unique)) {
         7 { 'TCP connection failed' }
         28 { 'Connection timed out' }
         { $_ -in 35, 51, 60 } { 'TLS handshake or certificate failed' }
+        90 { 'TLS public key did not match this VPS' }
         default { "Probe did not match this VPS (curl $code)" }
     }
     Write-Host "${HostName}:${port} - $status"
@@ -50,7 +59,7 @@ if (-not [int]::TryParse($choice, [ref]$port) -or $port -notin $verified) {
     throw 'Select one of the verified public ports.'
 }
 $url = "https://${HostName}:${port}/nat-relay/${Challenge}/select/${port}"
-$reply = & $curl --noproxy '*' --silent --connect-timeout 3 --max-time 5 --max-filesize 256 --fail --request POST $url
+$reply = & $curl @tlsArgs --noproxy '*' --silent --connect-timeout 3 --max-time 5 --max-filesize 256 --fail --request POST $url
 if ($LASTEXITCODE -ne 0 -or ($reply -join "`n").Trim() -cne "selected:${port}") {
     throw 'The VPS did not confirm the port. Check its probe terminal before retrying.'
 }
