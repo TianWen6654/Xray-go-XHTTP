@@ -10,6 +10,7 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   bash nat-relay.sh --check-egress       测试 HTTPS 隧道的出站 TCP 端口，无需 root
   sudo bash nat-relay.sh --host 公网域名或IPv4 --snell 公网端口:内部端口
   sudo bash nat-relay.sh --host 公网域名或IPv4 --xhttp-tcp 公网端口:内部端口
+  sudo bash nat-relay.sh --nat-web 公网域名 --public-ports 端口1,端口2 --listen-port 443
   sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
@@ -140,6 +141,15 @@ def mapping(value):
     except ValueError:
         pass
     raise argparse.ArgumentTypeError("请输入端口号或 公网端口:内部端口，范围 1–65535")
+
+
+def public_ports(value):
+    parts = re.split(r"[,，\s]+", value.strip())
+    if not 1 <= len(parts) <= 20 or any(
+        not re.fullmatch(r"[0-9]{1,5}", part) or not 1 <= int(part) <= 65535 for part in parts
+    ):
+        raise argparse.ArgumentTypeError("填写面板分配的 1–20 个 TCP 端口，以逗号分隔")
+    return list(dict.fromkeys(map(int, parts)))
 
 
 def discover_ipv4():
@@ -451,7 +461,8 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
     name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
             "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-tcp.service": "natr-xhttp",
             "nat-relay-xhttp-temp.service": "natr-temp", "nat-relay-wss.service": "natr-wss",
-            "nat-relay-ngrok.service": "natr-ngrok", "nat-relay-cloudflared.service": "natr-cf"}[unit]
+            "nat-relay-ngrok.service": "natr-ngrok", "nat-relay-cloudflared.service": "natr-cf",
+            "nat-relay-web.service": "natr-web", "nat-relay-web-xray.service": "natr-web-xray"}[unit]
     gid = service_gid(name)
     directory = UNIT_DATA / name
     for folder in (UNIT_DATA, directory):
@@ -480,14 +491,15 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
 
 
 def activate(binary, server, path, unit_path, arguments="run -c %d/config.json", credentials=None,
-             reuse_active=False):
+             reuse_active=False, bind_port=None):
     if unit_path.exists() and not unit_path.read_text().startswith(UNIT_MARK):
         raise ValueError(f"已有其他服务使用 {unit_path}")
     old = path.read_bytes() if path.exists() else None
     old_unit = unit_path.read_bytes() if unit_path.exists() else None
     inbounds = server.get("inbounds", []) if isinstance(server, dict) else []
     ports = (inbound.get("listen_port", inbound.get("port", 0)) for inbound in inbounds)
-    capabilities = "CAP_NET_BIND_SERVICE" if any(0 < port < 1024 for port in ports) else ""
+    needs_bind_capability = (bind_port is not None and bind_port < 1024) or any(0 < port < 1024 for port in ports)
+    capabilities = "CAP_NET_BIND_SERVICE" if needs_bind_capability else ""
     encoded = server if isinstance(server, bytes) else dump(server).encode()
     installing = False
     try:
@@ -1192,6 +1204,70 @@ def deploy(a):
         temporary_xhttp(binary, a.origin_port, a.exit_doh, keys["nrp_egress"] if a.relay_v1 else None)
 
 
+def deploy_nat_web(a):
+    import fcntl
+    from nat_web import caddy_binary, caddy_config, select_public_port, verify_local_site
+
+    if os.geteuid() or not RUNTIME_UNITS.is_dir():
+        raise ValueError("请在使用 systemd 的 Debian/Ubuntu VPS 上以 root 运行")
+    managed_cert = Path("/etc/letsencrypt/live") / a.nat_web
+    cert = a.cert or managed_cert / "fullchain.pem"
+    key = a.key or managed_cert / "privkey.pem"
+    temporary = not cert.is_file() or not key.is_file()
+    if temporary and a.cert:
+        raise ValueError("指定的 TLS 证书或私钥文件不存在。")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    with (ROOT / "install.lock").open("a") as lock, tempfile.TemporaryDirectory(dir=ROOT) as tls_dir:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tls_pin = cert_hash = None
+        if temporary:
+            cert, key = Path(tls_dir) / "cert.pem", Path(tls_dir) / "key.pem"
+            run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                "-nodes", "-days", "30", "-subj", f"/CN={a.nat_web}", "-addext",
+                f"subjectAltName=DNS:{a.nat_web}", "-keyout", key, "-out", cert)
+            public_key = run("openssl", "pkey", "-in", key, "-pubout", "-outform", "DER",
+                             stdout=subprocess.PIPE).stdout
+            tls_pin = "sha256//" + base64.b64encode(hashlib.sha256(public_key).digest()).decode("ascii")
+            der = run("openssl", "x509", "-in", cert, "-outform", "DER", stdout=subprocess.PIPE).stdout
+            cert_hash = hashlib.sha256(der).hexdigest()
+            print("已生成 30 天临时证书。探测和节点使用指纹校验，普通浏览器会提示证书未受信任。", flush=True)
+        else:
+            run("openssl", "verify", "-verify_hostname", a.nat_web, "-purpose", "sslserver",
+                "-untrusted", cert, cert)
+        public = select_public_port(a.nat_web, a.listen_port, a.public_ports, cert, key, tls_pin)
+        print(f"公网 TCP {public} → VPS TCP {a.listen_port} 已验证，正在部署。", flush=True)
+        caddy, xray = caddy_binary(), xray_binary()
+        identity = ROOT / "nat-web-identity.json"
+        keys = json.loads(identity.read_text()) if identity.exists() else credentials()
+        atomic(identity, dump(keys).encode())
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            backend = probe.getsockname()[1]
+        inbound = {"tag": "nat-web", "listen": "127.0.0.1", "port": backend, "protocol": "vless",
+                   "settings": {"clients": [{"id": keys["uuid"]}], "decryption": "none"},
+                   "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": keys["path"]}}}
+        server = xray_config([inbound], a.exit_doh)
+        server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
+        front = caddy_config(a.nat_web, a.listen_port, backend, keys["path"], cert.read_text(), key.read_text())
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            draft = Path(tmp) / "check.json"
+            atomic(draft, dump(server).encode())
+            run(xray, "run", "-test", "-c", draft)
+            atomic(draft, dump(front).encode())
+            run(caddy, "validate", "--config", draft)
+        activate(xray, server, ROOT / "nat-web-xray.json", UNIT.with_name("nat-relay-web-xray.service"))
+        activate(caddy, front, ROOT / "nat-web-caddy.json", UNIT.with_name("nat-relay-web.service"),
+                 arguments='run --config "%d/config.json"', bind_port=a.listen_port)
+        verify_local_site(a.nat_web, a.listen_port, keys["path"], cert if temporary else None)
+        params = dict(type="ws", security="tls", encryption="none",
+                      host=a.nat_web, sni=a.nat_web, alpn="http/1.1", path=keys["path"])
+        if cert_hash:
+            params["pcs"] = cert_hash
+        link = f"vless://{keys['uuid']}@{a.nat_web}:{public}?{urlencode(params)}#NAT-HTTPS"
+        atomic(ROOT / "nat-web.txt", (link + "\n").encode())
+        print(f"网站 https://{a.nat_web}:{public}/", link, sep="\n", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--auto", action="store_true", help="仅输入 TCP 映射，自动选择临时 XHTTP 回源端口")
@@ -1202,6 +1278,9 @@ def main():
     for flag in ("--tcp", "--udp", "--snell", "--xhttp-h3"):
         p.add_argument(flag, type=mapping, metavar="PUBLIC:LOCAL")
     p.add_argument("--xhttp-tcp", type=mapping, metavar="PUBLIC:LOCAL", help="通过 NAT 映射提供 XHTTP/HTTP2，支持自动签发并固定本地证书")
+    p.add_argument("--nat-web", type=domain, metavar="DOMAIN", help="先从客户端验证 NAT 映射，再部署 HTTPS 网站和代理")
+    p.add_argument("--public-ports", type=public_ports, help="面板已分配的候选公网 TCP 端口，用逗号分隔")
+    p.add_argument("--listen-port", type=int, default=443, help="NAT HTTPS 模式的 VPS 内部 TCP 端口，默认 443")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
     p.add_argument("--https-edge", type=domain, metavar="DOMAIN", help="由 HTTPS 入口提供加密 VLESS WebSocket")
     p.add_argument("--edge-provider", choices=("ngrok", "cloudflare"), default="ngrok", help="出站连接器，ngrok 用 TCP 443，Cloudflare 用 TCP 7844")
@@ -1213,6 +1292,16 @@ def main():
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.nat_web:
+        if not a.public_ports or not 1 <= a.listen_port <= 65535:
+            p.error("--nat-web 需要 --public-ports，内部端口范围为 1–65535")
+        if any((a.auto, a.ip, a.name, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp, a.xhttp_temp,
+                a.https_edge, a.cdn, a.check_egress, a.edge_provider != "ngrok")):
+            p.error("--nat-web 单独部署")
+        if (a.cert is None) != (a.key is None):
+            p.error("--cert 和 --key 必须一起填写")
+        deploy_nat_web(a)
+        return
     if a.check_egress:
         if any((a.https_edge, a.auto, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp, a.xhttp_temp)):
             p.error("--check-egress 单独运行")
@@ -1941,16 +2030,222 @@ def carrier_process(cfg, executable, local_port):
                 proc.kill()
                 proc.wait()
 NRP_FILE_MULTIPATH_PY
+cat > "$stage/nat_web.py" <<'NRP_FILE_NAT_WEB_PY'
+"""Verify a NAT mapping from the client before deploying a direct HTTPS site."""
+
+import base64
+import html
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import ssl
+import tempfile
+import time
+
+PROBE_CLIENT = (
+    "https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/"
+    "d4af257d4048caaccc3aa920a26f37d1544d0e79/nat-relay/Test-NatRelayPort.ps1"
+)
+
+
+class ProbeHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        self.respond("probe")
+
+    def do_POST(self):
+        self.respond("select")
+
+    def respond(self, operation):
+        session = self.server
+        match = re.fullmatch(r"/nat-relay/([a-f0-9]{32})/(probe|select)/([0-9]{1,5})", self.path)
+        if not match or not secrets.compare_digest(match[1], session.challenge) or match[2] != operation:
+            self.send_error(404)
+            return
+        port = int(match[3])
+        authorities = {f"{session.host}:{port}"}
+        if port == 443:
+            authorities.add(session.host)
+        if port not in session.ports or self.headers.get("Host", "").lower() not in authorities:
+            self.send_error(404)
+            return
+        if operation == "select" and port not in session.verified:
+            self.send_error(409)
+            return
+        reply = f"nat-relay:{session.challenge}:{port}" if operation == "probe" else f"selected:{port}"
+        data = reply.encode("ascii")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=ascii")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        if operation == "probe":
+            session.verified.add(port)
+        else:
+            session.selected = port
+
+
+class ProbeServer(HTTPServer):
+    timeout = 0.5
+
+    def __init__(self, listen, host, ports, cert, key):
+        self.host = host
+        self.ports = ports
+        self.challenge = secrets.token_hex(16)
+        self.verified = set()
+        self.selected = None
+        self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.tls.load_cert_chain(cert, key)
+        super().__init__(listen, ProbeHandler)
+
+    def get_request(self):
+        conn, address = super().get_request()
+        try:
+            conn.settimeout(1.5)
+            return self.tls.wrap_socket(conn, server_side=True), address
+        except OSError:
+            conn.close()
+            raise
+
+    def handle_error(self, request, client_address):
+        # Clients can close the socket while waiting for a short-lived probe response.
+        pass
+
+
+def select_public_port(host, local, candidates, cert, key, tls_pin=None):
+    try:
+        server = ProbeServer(("0.0.0.0", local), host, candidates, cert, key)
+    except ssl.SSLError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"无法启动 {local} 的预检监听：{exc}。请选择空闲的 VPS 内部 TCP 端口。") from exc
+    with server:
+        ports = ",".join(map(str, candidates))
+        command = (
+            f"& ([ScriptBlock]::Create((Invoke-RestMethod '{PROBE_CLIENT}'))) "
+            f"-HostName '{host}' -PublicPorts @({ports}) -Challenge '{server.challenge}'"
+        )
+        if tls_pin:
+            command += f" -TlsPin '{tls_pin}'"
+        print(f"请将面板已分配的候选公网 TCP 端口 {ports} 临时映射到 VPS 内部 {local}。", flush=True)
+        print("在要使用的客户端网络上打开 Windows PowerShell，运行下面整行。", command, sep="\n", flush=True)
+        print("从已验证端口中选一个并保留其映射。等待 5 分钟，Ctrl+C 可取消。", flush=True)
+        deadline = time.monotonic() + 300
+        while server.selected is None and time.monotonic() < deadline:
+            server.handle_request()
+        if server.selected is None:
+            raise ValueError("尚未收到客户端确认。可以检查 DNS、端口映射和证书链后重试。")
+        return server.selected
+
+
+def caddy_config(host, local, backend, path, cert, key):
+    site = ("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
+            "<title>HTTPS 服务</title><main><h1>HTTPS 服务在线</h1>"
+            f"<p>{html.escape(host)}</p></main></html>")
+    return {
+        "admin": {"disabled": True, "config": {"persist": False}},
+        "apps": {
+            "tls": {"certificates": {"load_pem": [{"certificate": cert, "key": key}]}},
+            "http": {"servers": {"nat-web": {
+                "listen": [f"0.0.0.0:{local}"],
+                "protocols": ["h1", "h2"],
+                "automatic_https": {"disable": True},
+                "tls_connection_policies": [{}],
+                "routes": [
+                    {"match": [{"host": [host], "path": [path]}], "terminal": True,
+                     "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": f"127.0.0.1:{backend}"}]}]},
+                    {"match": [{"host": [host], "path": ["/"]}], "terminal": True,
+                     "handle": [{"handler": "static_response", "body": site,
+                                 "headers": {"Content-Type": ["text/html; charset=utf-8"]}}]},
+                    {"handle": [{"handler": "static_response", "status_code": 404}]},
+                ],
+            }}},
+        },
+    }
+
+
+def verify_local_site(host, local, path, cafile=None):
+    ctx = ssl.create_default_context(cafile=str(cafile) if cafile else None)
+    for endpoint, expected in (("/", 200), (path, 101)):
+        with socket.create_connection(("127.0.0.1", local), timeout=4) as connection:
+            with ctx.wrap_socket(connection, server_hostname=host) as tls:
+                headers = ""
+                if expected == 101:
+                    nonce = secrets.token_bytes(16)
+                    headers = (
+                        "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                        f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {base64.b64encode(nonce).decode()}\r\n"
+                    )
+                tls.sendall(f"GET {endpoint} HTTP/1.1\r\nHost: {host}\r\n{headers}\r\n".encode("ascii"))
+                response = http.client.HTTPResponse(tls)
+                response.begin()
+                if response.status != expected:
+                    raise ValueError(f"本机 HTTPS 自检返回 HTTP {response.status}，预期 {expected}。")
+                response.close()
+
+
+def caddy_binary():
+    import platform
+    import shutil
+    import tarfile
+    from urllib.request import urlopen
+
+    existing = shutil.which("caddy")
+    binary = Path("/usr/local/lib/nat-relay/caddy")
+    if existing or binary.is_file():
+        return existing or binary
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if not arch:
+        raise ValueError("此平台请先安装官方 Caddy 软件包")
+    with urlopen("https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=20) as response:
+        release = json.load(response)
+    suffix = f"_linux_{arch}.tar.gz"
+    asset = next((a for a in release["assets"] if a["name"].startswith("caddy_") and a["name"].endswith(suffix)), {})
+    digest = asset.get("digest") or ""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("官方 Caddy 发行包缺少 SHA-256 校验信息")
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=binary.parent) as tmp:
+        archive = Path(tmp) / "caddy.tar.gz"
+        sha = hashlib.sha256()
+        with urlopen(asset["browser_download_url"], timeout=45) as response, archive.open("wb") as f:
+            while chunk := response.read(128 * 1024):
+                sha.update(chunk)
+                f.write(chunk)
+        if "sha256:" + sha.hexdigest() != digest:
+            raise ValueError("Caddy 下载文件的 SHA-256 校验失败")
+        staged = Path(tmp) / "caddy"
+        with tarfile.open(archive, "r:gz") as package:
+            member = package.getmember("caddy")
+            if not member.isfile():
+                raise ValueError("Caddy 发行包结构不符合预期")
+            with package.extractfile(member) as src, staged.open("wb") as dst:
+                shutil.copyfileobj(src, dst, 128 * 1024)
+        staged.chmod(0o755)
+        os.replace(staged, binary)
+    return binary
+NRP_FILE_NAT_WEB_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-4126412ea3c111a1a437c202efbfd285691c30bd46a67b81a4e386d090e41c6a  install.py
+225fd0ffb979a12798d76e00199f98fc21c76ae3bb958e78465acb2ec8507a80  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
+e383d34abab9626534e665cd26f2cce7b16afba0cf2b3bc91f10049dbaae14ab  nat_web.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
 
 if [[ $action == check ]]; then
-    python3 -I -B -c 'import pathlib,sys; sys.version_info >= (3, 9) or sys.exit("需要 Python 3.9 或更新版本。"); p=pathlib.Path(sys.argv[1]).resolve(); sys.path.insert(0,str(p)); import install,relay_v1,multipath; assert all(pathlib.Path(m.__file__).parent == p for m in (install,relay_v1,multipath))' "$stage"
-    printf '%s\n' '通过：三个内嵌模块的 SHA-256 和 Python 导入检查均成功。'
+    python3 -I -B -c 'import pathlib,sys; sys.version_info >= (3, 9) or sys.exit("需要 Python 3.9 或更新版本。"); p=pathlib.Path(sys.argv[1]).resolve(); sys.path.insert(0,str(p)); import install,relay_v1,multipath,nat_web; assert all(pathlib.Path(m.__file__).parent == p for m in (install,relay_v1,multipath,nat_web))' "$stage"
+    printf '%s\n' '通过：内嵌模块的 SHA-256 和 Python 导入检查均成功。'
     exit 0
 fi
 if [[ $action == options ]]; then
