@@ -11,6 +11,7 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh --host 公网域名或IPv4 --snell 公网端口:内部端口
   sudo bash nat-relay.sh --host 公网域名或IPv4 --xhttp-tcp 公网端口:内部端口
   sudo bash nat-relay.sh --nat-web 公网域名 --public-ports 端口1,端口2 --listen-port 443
+  sudo bash nat-relay.sh --switch-web-port --public-ports 端口1,端口2
   sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
@@ -107,7 +108,7 @@ import sys
 from types import SimpleNamespace
 import tempfile
 import time
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit, urlunsplit
 import uuid
 import warnings
 
@@ -1268,6 +1269,64 @@ def deploy_nat_web(a):
         print(f"网站 https://{a.nat_web}:{public}/", link, sep="\n", flush=True)
 
 
+def switch_nat_web_port(candidates):
+    import fcntl
+    from nat_web import PROBE_CLIENT, verify_local_site
+
+    if os.geteuid() or not RUNTIME_UNITS.is_dir() or not sys.stdin.isatty():
+        raise ValueError("请在 VPS 的 root 交互终端切换公网端口")
+    source = ROOT / "nat-web.txt"
+    config = ROOT / "nat-web-caddy.json"
+    if not source.is_file() or not config.is_file():
+        raise ValueError("尚未找到已部署的 NAT HTTPS 节点，请先运行 --nat-web。")
+    with (ROOT / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = urlsplit(source.read_text().strip())
+        fields = parse_qs(current.query)
+        host = domain(current.hostname or "")
+        path = fields.get("path", [""])[0]
+        if (current.scheme != "vless" or not current.port or not current.username or current.password
+                or fields.get("type") != ["ws"] or fields.get("security") != ["tls"]
+                or not re.fullmatch(r"/ws-[0-9a-f]{24}", path)):
+            raise ValueError("现有节点格式不符合 NAT HTTPS 安装器的输出。")
+        uuid.UUID(current.username)
+        front = json.loads(config.read_text())["apps"]
+        local = int(front["http"]["servers"]["nat-web"]["listen"][0].rsplit(":", 1)[1])
+        run("systemctl", "is-active", "--quiet", "nat-relay-web.service", "nat-relay-web-xray.service")
+        ports = ",".join(map(str, candidates))
+        command = (f"& ([ScriptBlock]::Create((Invoke-RestMethod '{PROBE_CLIENT}'))) "
+                   f"-HostName '{host}' -PublicPorts @({ports}) -WebSocketPath '{path}'")
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            cafile = None
+            if "pcs" in fields:
+                pem = front["tls"]["certificates"]["load_pem"][0]["certificate"].encode()
+                der = run("openssl", "x509", "-outform", "DER", input=pem, stdout=subprocess.PIPE).stdout
+                if fields["pcs"] != [hashlib.sha256(der).hexdigest()]:
+                    raise ValueError("节点指纹与当前 HTTPS 配置不一致。")
+                pubkey = run("openssl", "x509", "-pubkey", "-noout", input=pem, stdout=subprocess.PIPE).stdout
+                spki = run("openssl", "pkey", "-pubin", "-outform", "DER", input=pubkey, stdout=subprocess.PIPE).stdout
+                pin = base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+                command += f" -TlsPin 'sha256//{pin}'"
+                cafile = Path(tmp) / "cert.pem"
+                atomic(cafile, pem)
+            verify_local_site(host, local, path, cafile)
+        print(f"当前公网 TCP {current.port} → VPS 内部 {local}。先保留旧映射。", flush=True)
+        print(f"将新候选公网 TCP 端口 {ports} 映射到同一个内部端口 {local}。", flush=True)
+        print("在客户端 Windows PowerShell 运行下面整行，确认列为 Verified 的端口。", command, sep="\n", flush=True)
+        try:
+            chosen = input("填入一个 Verified 端口，或按回车取消：").strip()
+        except EOFError:
+            chosen = ""
+        if not chosen:
+            return
+        if not re.fullmatch(r"[0-9]{1,5}", chosen) or int(chosen) not in candidates:
+            raise ValueError("请选择已验证的候选端口。")
+        public = int(chosen)
+        link = urlunsplit(current._replace(netloc=f"{current.username}@{host}:{public}"))
+        atomic(source, (link + "\n").encode())
+        print(f"网站 https://{host}:{public}/", link, sep="\n", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--auto", action="store_true", help="仅输入 TCP 映射，自动选择临时 XHTTP 回源端口")
@@ -1279,6 +1338,7 @@ def main():
         p.add_argument(flag, type=mapping, metavar="PUBLIC:LOCAL")
     p.add_argument("--xhttp-tcp", type=mapping, metavar="PUBLIC:LOCAL", help="通过 NAT 映射提供 XHTTP/HTTP2，支持自动签发并固定本地证书")
     p.add_argument("--nat-web", type=domain, metavar="DOMAIN", help="先从客户端验证 NAT 映射，再部署 HTTPS 网站和代理")
+    p.add_argument("--switch-web-port", action="store_true", help="验证并更换已部署 NAT HTTPS 节点的公网 TCP 端口")
     p.add_argument("--public-ports", type=public_ports, help="面板已分配的候选公网 TCP 端口，用逗号分隔")
     p.add_argument("--listen-port", type=int, default=443, help="NAT HTTPS 模式的 VPS 内部 TCP 端口，默认 443")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
@@ -1292,6 +1352,12 @@ def main():
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.switch_web_port:
+        if not a.public_ports or any((a.nat_web, a.auto, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp,
+                                      a.xhttp_temp, a.https_edge, a.check_egress)):
+            p.error("--switch-web-port 单独运行，并用 --public-ports 指定候选端口")
+        switch_nat_web_port(a.public_ports)
+        return
     if a.nat_web:
         if not a.public_ports or not 1 <= a.listen_port <= 65535:
             p.error("--nat-web 需要 --public-ports，内部端口范围为 1–65535")
@@ -2050,7 +2116,7 @@ import time
 
 PROBE_CLIENT = (
     "https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/"
-    "d4af257d4048caaccc3aa920a26f37d1544d0e79/nat-relay/Test-NatRelayPort.ps1"
+    "05b5c33aaab92bfbe1e1f17284409b66cb05902d/nat-relay/Test-NatRelayPort.ps1"
 )
 
 
@@ -2236,10 +2302,10 @@ def caddy_binary():
     return binary
 NRP_FILE_NAT_WEB_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-225fd0ffb979a12798d76e00199f98fc21c76ae3bb958e78465acb2ec8507a80  install.py
+931ac7b3f99aee56efbccfe89df48efbb9953088a12ebdc9fa50b7ea1af55ba6  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
-e383d34abab9626534e665cd26f2cce7b16afba0cf2b3bc91f10049dbaae14ab  nat_web.py
+ea78eb7d61fc220f60cde1bfb253a805c40c30162c9fefb4f26a354d4d951de6  nat_web.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
 
