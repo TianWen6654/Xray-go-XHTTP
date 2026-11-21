@@ -1,16 +1,26 @@
 # 低内存 NAT VPS 的 sing-box 和 Xray 安装器
 
-## HTTPS 443 出站接入
+## HTTPS 443 接入
 
-使用 ngrok 控制台分配的开发域名，在 VPS 的交互终端运行以下命令。确认本机回环端口 `8001` 空闲，也可以指定其他未占用的端口。安装器会隐藏输入 authtoken，验证公网 HTTPS 和 WebSocket 后输出 VLESS 链接。
+在 VPS 上运行 `bash nat-relay.sh --check-egress` 可探测 ngrok 的 TCP 443 和 Cloudflare 的 TCP 7844。这个命令只发起 DNS 查询和 TCP 握手。面板的常规入站端口映射与出站访问权限独立。若服务商还限制出站，需要在上游开通所选连接器的目标端口。
+
+使用 ngrok 控制台分配的开发域名，在 VPS 的交互终端运行以下命令。使用 `--origin-port 0` 时，脚本会复用已安装服务的本地端口，或选一个空闲的回环端口。安装器会隐藏输入 authtoken，验证公网 HTTPS 和 WebSocket 后输出 VLESS 链接。
 
 ```bash
-sudo bash nat-relay.sh --https-edge your-domain.ngrok-free.dev --origin-port 8001
+sudo bash nat-relay.sh --https-edge your-domain.ngrok-free.dev --origin-port 0
 ```
 
 客户端连接公网域名的 HTTPS/TCP 443。VPS 上的 ngrok 代理通过出站 TCP 443 建立隧道，并转发至仅监听回环地址的 Xray。VLESS Encryption 保护网关到客户端之间的代理负载，导入链接时使用支持该功能的 Xray 内核。此模式拒绝 UDP 转发，DNS 查询和 ngrok 域名解析仍取决于各设备的解析器设置。VPS 面板无需配置入站端口转发。部署后可通过 `systemctl status nat-relay-ngrok nat-relay-wss` 检查两项服务。
 
 VPS 需要能访问 ngrok 的出站 TCP 443，客户端也需要能访问所分配的 HTTPS 域名。免费套餐有流量额度。[ngrok 出站连接说明](https://ngrok.com/docs/gateway/site-to-site-connectivity/end-customers) · [套餐额度](https://ngrok.com/docs/pricing-limits)
+
+也可以使用已有的 Cloudflare 命名隧道。先在 Cloudflare 控制台添加公开主机名，将 HTTP 回源地址设为 `http://127.0.0.1:8001`，再执行：
+
+```bash
+sudo bash nat-relay.sh --https-edge relay.example.com --edge-provider cloudflare --origin-port 8001
+```
+
+按提示隐藏输入该隧道的 token。客户端使用 HTTPS/TCP 443，VPS 连接器固定使用 HTTP/2 over TCP 7844。同时运行两个连接器时，请让它们使用相同的本地回环端口。大陆线路对各入口域名的解析和连通性可能不同，可以在实际使用的宽带或移动网络上分别测试，再选择可用入口。连接器与客户端都需要能访问各自的服务端点。[Cloudflare Tunnel 防火墙端口](https://developers.cloudflare.com/tunnel/configuration/#firewall-rules) · [Cloudflare 连接器协议](https://developers.cloudflare.com/tunnel/reference/run-parameters/#protocol)
 
 ## 单文件安装
 
