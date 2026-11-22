@@ -67,16 +67,16 @@ bash nat-relay.sh --host nat.example.com --xhttp-tcp 10882:443
 GitHub 下载器核对 SHA-256 后保存为 `$HOME/nat-relay.sh`。下载版本及摘要由 `get.sh` 固定。
 
 ```bash
-(set -o pipefail; curl -fsSL --retry 2 https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/main/nat-relay/get.sh | bash)
+(set -o pipefail; curl -fsSL --retry 2 https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/36c15131aea9719c6eb439bef53ca78138302d34/nat-relay/get.sh | bash)
 ```
 
 对于尚未确认 systemd 环境的 Podman VPS，可先下载并自检。自检需要 Python 3.9+。将 `--check` 换为 `--download-only` 可仅保存脚本。
 
 ```bash
-(set -o pipefail; wget -O- -nv https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/main/nat-relay/get.sh | bash -s -- --check)
+(set -o pipefail; wget -O- -nv https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/36c15131aea9719c6eb439bef53ca78138302d34/nat-relay/get.sh | bash -s -- --check)
 ```
 
-默认部署 Snell 6 和临时 XHTTP。脚本优先读取 SSH 会话的公网服务端 IPv4，否则通过 HTTPS 查询出口 IPv4。若提供商使用不同的 NAT 入口，请执行 `bash /root/nat-relay.sh --auto --ip 面板入口IPv4`。XHTTP 自动选择可用的回环端口。
+使用 `--auto` 可部署 Snell 6 和临时 XHTTP。脚本优先读取 SSH 会话的公网服务端 IPv4，否则通过 HTTPS 查询出口 IPv4。若提供商使用不同的 NAT 入口，请执行 `bash /root/nat-relay.sh --auto --host 面板公网入口`。临时 XHTTP 自动选择可用的回环端口。
 
 安装器先用一个短时 systemd 服务测试挂载命名空间和凭据。在返回 `226/NAMESPACE` 或 `243/CREDENTIALS` 的容器中，每种服务使用独立的非登录系统账号。其配置及所需证书位于 `/etc/nat-relay-unit-data/` 下各自的目录，文件由 root 所有，仅授予对应服务组读取权限。临时 XHTTP 服务退出时会清理其运行配置。
 
