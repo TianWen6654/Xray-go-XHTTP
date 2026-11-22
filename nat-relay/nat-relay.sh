@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
-  sudo bash nat-relay.sh                 自动配置 Snell 6 和临时 XHTTP，只问 TCP 端口
+  sudo bash nat-relay.sh                 单进程 XHTTP/HTTP2，只问 TCP 端口映射
+  sudo bash nat-relay.sh --host 公网入口 --auto-tcp  用面板入口，交互填写端口
   sudo bash nat-relay.sh --menu          选择其他部署模式
   bash nat-relay.sh --check              离线验证内嵌文件，无需 root
   bash nat-relay.sh --check-egress       测试 HTTPS 隧道的出站 TCP 端口，无需 root
@@ -15,7 +16,7 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
-安装时默认启用 --multipath。只有一个载体时也能测试连通性。
+直接 XHTTP/HTTP2 可用 --multipath 显式开启聚合。
 HELP
 }
 
@@ -38,18 +39,19 @@ if [[ $action == install ]]; then
     [[ -d /run/systemd/system ]] || fail '当前系统没有运行 systemd。'
     command -v apt-get >/dev/null || fail '此安装器需要 Debian/Ubuntu 的 apt-get。'
     if [[ $# == 0 ]]; then
-        [[ -t 0 ]] || fail '请在终端启动，或用 --auto --snell 公网端口:内部端口。'
-        set -- --auto
+        [[ -t 0 ]] || fail '请在终端启动，或用 --host 公网入口 --xhttp-tcp 公网端口:内部端口。'
+        set -- --auto-tcp
     elif [[ $# == 1 && $1 == --menu ]]; then
         [[ -t 0 ]] || fail '非交互运行需要提供协议参数。可执行 bash nat-relay.sh --help。'
         printf '%s\n' \
             '1) Snell 6 + 临时 XHTTP（一个 TCP 映射，无需自备证书）' \
             '2) Snell 6 + Hysteria 2（TCP 和 UDP 映射，需域名证书）' \
             '3) 仅 Snell 6（一个 TCP 映射）' \
-            '4) 仅临时 XHTTP（无需新增公网映射）'
+            '4) 仅临时 XHTTP（无需新增公网映射）' \
+            '5) 直连 XHTTP/HTTP2（一个 TCP 映射，无需第三方隧道）'
         read -r -p '选择 [1]: ' mode
         mode=${mode:-1}
-        case "$mode" in 1|2|3|4) ;; *) fail '请选择 1 至 4';; esac
+        case "$mode" in 1|2|3|4|5) ;; *) fail '请选择 1 至 5';; esac
         params=()
         if [[ $mode != 4 ]]; then
             while :; do
@@ -57,7 +59,11 @@ if [[ $action == install ]]; then
                 [[ -n $tcp ]] && break
                 printf '%s\n' '请输入端口号。'
             done
-            params+=(--snell "$tcp")
+            if [[ $mode == 5 ]]; then
+                params+=(--auto-tcp --xhttp-tcp "$tcp")
+            else
+                params+=(--snell "$tcp")
+            fi
         fi
         if [[ $mode == 2 ]]; then
             read -r -p 'UDP 映射（公网端口:内部端口）: ' udp
@@ -492,7 +498,7 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
 
 
 def activate(binary, server, path, unit_path, arguments="run -c %d/config.json", credentials=None,
-             reuse_active=False, bind_port=None):
+             reuse_active=False, bind_port=None, verify=None):
     if unit_path.exists() and not unit_path.read_text().startswith(UNIT_MARK):
         raise ValueError(f"已有其他服务使用 {unit_path}")
     old = path.read_bytes() if path.exists() else None
@@ -508,6 +514,8 @@ def activate(binary, server, path, unit_path, arguments="run -c %d/config.json",
             unit = service_unit(binary, arguments.replace("%d", directory), props, capabilities).encode()
             if (reuse_active and old == encoded and old_unit == unit
                     and subprocess.run(["systemctl", "is-active", "--quiet", unit_path.name]).returncode == 0):
+                if verify:
+                    verify()
                 run("systemctl", "enable", unit_path.name)
                 return
             installing = True
@@ -517,6 +525,8 @@ def activate(binary, server, path, unit_path, arguments="run -c %d/config.json",
             run("systemctl", "restart", unit_path.name)
             time.sleep(2)
             run("systemctl", "is-active", "--quiet", unit_path.name)
+            if verify:
+                verify()
             run("systemctl", "enable", unit_path.name)
     except BaseException:
         if installing:
@@ -854,6 +864,8 @@ def temporary_xhttp(binary, port, doh, password=None):
 
 
 def direct_xhttp(binary, a, keys, kind, ports, cert, key):
+    from nat_web import verify_tcp_tls
+
     alpn, name, fingerprint = ("h2" if kind == "xhttp-tcp" else "h3"), a.name, None
     if not cert:
         name = "xhttp.nrp.invalid"
@@ -867,13 +879,31 @@ def direct_xhttp(binary, a, keys, kind, ports, cert, key):
     server = xray_config([xhttp_inbound(kind, local, uid, path, cert, key, alpn)], a.exit_doh)
     if a.relay_v1:
         enable_carrier(server, kind, keys["nrp_egress"])
+    elif alpn == "h2":
+        server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
         draft = Path(tmp) / "check.json"
         atomic(draft, dump(server).encode())
         run(binary, "run", "-test", "-c", draft)
     unit = "nat-relay-xhttp-tcp.service" if alpn == "h2" else "nat-relay-xray.service"
     config = "xhttp-tcp.json" if alpn == "h2" else "xray.json"
-    activate(binary, server, ROOT / config, UNIT.with_name(unit))
+    verify = None
+    if alpn == "h2":
+        def verify():
+            try:
+                verify_tcp_tls("127.0.0.1", local, name, alpn, fingerprint)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"VPS 本机 TCP {local} 的 TLS/HTTP2 自检失败：{error}") from error
+    activate(binary, server, ROOT / config, UNIT.with_name(unit), reuse_active=True, verify=verify)
+    if alpn == "h2":
+        print(f"VPS 本机 TCP {local} 已通过 TLS/HTTP2 自检。面板映射应为 TCP {public} → {local}。", flush=True)
+        try:
+            verify_tcp_tls(str(a.ip), public, name, alpn, fingerprint)
+        except (OSError, ValueError) as error:
+            print(f"从 VPS 到公网入口 {a.ip}:{public} 的回环测试未通过：{error}。"
+                  "请核对面板映射并从客户端运行真实代理测试。", file=sys.stderr, flush=True)
+        else:
+            print("从 VPS 到公网入口的回环测试通过。请从实际使用的客户端验证代理请求。", flush=True)
     tag = "XHTTP-TCP" if alpn == "h2" else "XHTTP-H3"
     args = (a.ip, public, name, alpn, uid, path, tag, fingerprint)
     link = xhttp_link(*args)
@@ -1330,6 +1360,7 @@ def switch_nat_web_port(candidates):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--auto", action="store_true", help="仅输入 TCP 映射，自动选择临时 XHTTP 回源端口")
+    p.add_argument("--auto-tcp", action="store_true", help="仅输入 TCP 映射，部署单进程 XHTTP/HTTP2")
     p.add_argument("--host", "--ip", dest="ip", type=entry_host, help="NAT 公网入口域名或 IPv4")
     p.add_argument("--name", type=domain, help="直连 TLS 证书域名")
     p.add_argument("--cert", type=Path, help="受信任的完整证书链")
@@ -1352,6 +1383,17 @@ def main():
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.auto_tcp:
+        if any((a.auto, a.nat_web, a.switch_web_port, a.https_edge, a.check_egress, a.tcp, a.udp,
+                a.snell, a.xhttp_h3, a.xhttp_temp, a.cdn, a.relay_v1)):
+            p.error("--auto-tcp 单独部署，可用 --host 指定公网入口")
+        while not a.xhttp_tcp:
+            try:
+                a.xhttp_tcp = mapping(input("TCP 映射（如 10882:443，端口相同可直接填一个端口）：").strip())
+            except EOFError:
+                p.error("终端输入已关闭，请用 --xhttp-tcp 公网端口:内部端口")
+            except argparse.ArgumentTypeError as error:
+                print(error, file=sys.stderr)
     if a.switch_web_port:
         if not a.public_ports or any((a.nat_web, a.auto, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp,
                                       a.xhttp_temp, a.https_edge, a.check_egress)):
@@ -2260,6 +2302,23 @@ def verify_local_site(host, local, path, cafile=None):
                 response.close()
 
 
+def verify_tcp_tls(address, port, server_name, protocol, fingerprint=None):
+    """Check a TCP listener's certificate and negotiated application protocol."""
+    context = ssl.create_default_context()
+    if fingerprint is not None:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    context.set_alpn_protocols([protocol])
+    with socket.create_connection((address, port), timeout=4) as connection:
+        with context.wrap_socket(connection, server_hostname=server_name) as tls:
+            if fingerprint is not None:
+                certificate = tls.getpeercert(binary_form=True)
+                if not certificate or not secrets.compare_digest(hashlib.sha256(certificate).hexdigest(), fingerprint):
+                    raise ValueError("TLS 证书指纹与此节点的证书不一致。")
+            if tls.selected_alpn_protocol() != protocol:
+                raise ValueError(f"TLS 服务未协商出 {protocol}。")
+
+
 def caddy_binary():
     import platform
     import shutil
@@ -2302,10 +2361,10 @@ def caddy_binary():
     return binary
 NRP_FILE_NAT_WEB_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-931ac7b3f99aee56efbccfe89df48efbb9953088a12ebdc9fa50b7ea1af55ba6  install.py
+12e419cfdf048220535ad87bf264af5e5861504451c297a291dd396993db3b7c  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
-ea78eb7d61fc220f60cde1bfb253a805c40c30162c9fefb4f26a354d4d951de6  nat_web.py
+dd8126e93df71f2ae3bf663590cd5e90ecfaebeaa0a87d50f430c209502bb60a  nat_web.py
 NRP_SHA256
 ) || fail "内嵌文件校验失败。"
 
@@ -2337,7 +2396,16 @@ read_oom_kills() {
 
 read_oom_kills
 oom_before=$oom_kills
-if python3 -B "$stage/install.py" --multipath "$@"; then
+relay=(--multipath)
+for option in "$@"; do
+    case "$option" in
+        --auto-tcp|--xhttp-tcp|--xhttp-tcp=*)
+            relay=()
+            break
+            ;;
+    esac
+done
+if python3 -B "$stage/install.py" "${relay[@]}" "$@"; then
     exit 0
 else
     status=$?
