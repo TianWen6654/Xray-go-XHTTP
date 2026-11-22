@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Pin the artifact and its digest together when publishing a new version.
-url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/b0ae7c6f4273e02ff85ad0e9ea1db7ff744c0919/nat-relay/nat-relay.sh'
-digest='bf90c7adb0256bdf206f1bc7ef305ce9c08120cd86cfb023cc0570998058718e'
+url='https://raw.githubusercontent.com/TianWen6654/Xray-go-XHTTP/234c1c12ea9a1667f3ad93aff526b955136cbd17/nat-relay/nat-relay.sh'
+digest='57920c5de2630c4868fae02a3ec561b8f18e3852f2c2c479af3c92c2268ed32c'
 
 download() {
     local target="$HOME/nat-relay.sh"
