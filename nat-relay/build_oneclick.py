@@ -22,6 +22,8 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh --nat-web 公网域名 --public-ports 端口1,端口2 --listen-port 443
   sudo bash nat-relay.sh --switch-web-port --public-ports 端口1,端口2
   sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
+  sudo bash nat-relay.sh --quick-edge     临时 HTTPS 入口，无需公网映射、域名或令牌
+  sudo bash nat-relay.sh --show-quick-edge  验证当前临时域名并输出节点
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 直接 XHTTP/HTTP2 可用 --multipath 显式开启聚合。
@@ -56,12 +58,13 @@ if [[ $action == install ]]; then
             '2) Snell 6 + Hysteria 2（TCP 和 UDP 映射，需域名证书）' \
             '3) 仅 Snell 6（一个 TCP 映射）' \
             '4) 仅临时 XHTTP（无需新增公网映射）' \
-            '5) 直连 XHTTP/HTTP2（一个 TCP 映射，无需第三方隧道）'
+            '5) 直连 XHTTP/HTTP2（一个 TCP 映射，无需第三方隧道）' \
+            '6) 临时 HTTPS 入口（仅 TCP，无需公网映射、域名或令牌）'
         read -r -p '选择 [1]: ' mode
         mode=${mode:-1}
-        case "$mode" in 1|2|3|4|5) ;; *) fail '请选择 1 至 5';; esac
+        case "$mode" in 1|2|3|4|5|6) ;; *) fail '请选择 1 至 6';; esac
         params=()
-        if [[ $mode != 4 ]]; then
+        if [[ $mode != 4 && $mode != 6 ]]; then
             while :; do
                 read -r -p 'TCP 映射（同端口填一个数字，不同则填公网端口:内部端口）: ' tcp || fail '终端输入已关闭。'
                 [[ -n $tcp ]] && break
@@ -84,6 +87,7 @@ if [[ $action == install ]]; then
             read -r -p '临时 XHTTP 的 VPS 本地端口 [8001]: ' origin
             params+=(--xhttp-temp --origin-port "${origin:-8001}")
         fi
+        if [[ $mode == 6 ]]; then params+=(--quick-edge); fi
         set -- "${params[@]}"
     fi
     packages=()
@@ -91,8 +95,8 @@ if [[ $action == install ]]; then
     command -v openssl >/dev/null || packages+=(openssl)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     if (( ${#packages[@]} )); then
-        apt-get update
-        apt-get install -y --no-install-recommends "${packages[@]}"
+        apt-get -o Acquire::Languages=none update
+        DEBIAN_FRONTEND=noninteractive DPKG_DEB_THREADS_MAX=1 apt-get install -y --no-install-recommends "${packages[@]}"
     fi
 fi
 command -v python3 >/dev/null || fail '需要 Python 3.9 或更新版本。'
@@ -131,7 +135,7 @@ oom_before=$oom_kills
 relay=(--multipath)
 for option in "$@"; do
     case "$option" in
-        --auto-tcp|--xhttp-tcp|--xhttp-tcp=*)
+        --auto-tcp|--xhttp-tcp|--xhttp-tcp=*|--quick-edge|--show-quick-edge)
             relay=()
             break
             ;;

@@ -14,6 +14,8 @@ NRP/2 单文件安装器（Debian 12+ 或 Ubuntu 22.04+，使用 systemd）
   sudo bash nat-relay.sh --nat-web 公网域名 --public-ports 端口1,端口2 --listen-port 443
   sudo bash nat-relay.sh --switch-web-port --public-ports 端口1,端口2
   sudo bash nat-relay.sh --https-edge 公网域名 --edge-provider ngrok或cloudflare --origin-port 8001
+  sudo bash nat-relay.sh --quick-edge     临时 HTTPS 入口，无需公网映射、域名或令牌
+  sudo bash nat-relay.sh --show-quick-edge  验证当前临时域名并输出节点
   sudo bash nat-relay.sh --xhttp-temp --origin-port 8001
   bash nat-relay.sh --options            显示全部协议参数
 直接 XHTTP/HTTP2 可用 --multipath 显式开启聚合。
@@ -48,12 +50,13 @@ if [[ $action == install ]]; then
             '2) Snell 6 + Hysteria 2（TCP 和 UDP 映射，需域名证书）' \
             '3) 仅 Snell 6（一个 TCP 映射）' \
             '4) 仅临时 XHTTP（无需新增公网映射）' \
-            '5) 直连 XHTTP/HTTP2（一个 TCP 映射，无需第三方隧道）'
+            '5) 直连 XHTTP/HTTP2（一个 TCP 映射，无需第三方隧道）' \
+            '6) 临时 HTTPS 入口（仅 TCP，无需公网映射、域名或令牌）'
         read -r -p '选择 [1]: ' mode
         mode=${mode:-1}
-        case "$mode" in 1|2|3|4|5) ;; *) fail '请选择 1 至 5';; esac
+        case "$mode" in 1|2|3|4|5|6) ;; *) fail '请选择 1 至 6';; esac
         params=()
-        if [[ $mode != 4 ]]; then
+        if [[ $mode != 4 && $mode != 6 ]]; then
             while :; do
                 read -r -p 'TCP 映射（同端口填一个数字，不同则填公网端口:内部端口）: ' tcp || fail '终端输入已关闭。'
                 [[ -n $tcp ]] && break
@@ -76,6 +79,7 @@ if [[ $action == install ]]; then
             read -r -p '临时 XHTTP 的 VPS 本地端口 [8001]: ' origin
             params+=(--xhttp-temp --origin-port "${origin:-8001}")
         fi
+        if [[ $mode == 6 ]]; then params+=(--quick-edge); fi
         set -- "${params[@]}"
     fi
     packages=()
@@ -83,8 +87,8 @@ if [[ $action == install ]]; then
     command -v openssl >/dev/null || packages+=(openssl)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     if (( ${#packages[@]} )); then
-        apt-get update
-        apt-get install -y --no-install-recommends "${packages[@]}"
+        apt-get -o Acquire::Languages=none update
+        DEBIAN_FRONTEND=noninteractive DPKG_DEB_THREADS_MAX=1 apt-get install -y --no-install-recommends "${packages[@]}"
     fi
 fi
 command -v python3 >/dev/null || fail '需要 Python 3.9 或更新版本。'
@@ -463,13 +467,18 @@ def service_access(unit, config_path, encoded, extra, temporary=False):
     if has_service_namespace():
         properties = ["DynamicUser=yes", "ProtectSystem=strict", "ProtectHome=yes"]
         properties.extend(f"LoadCredential={key}:{value}" for key, value in sources.items())
-        yield properties, f"/run/credentials/{unit}" if temporary else "%d"
+        # System services use this credential directory even on systemd 247,
+        # which supports LoadCredential but does not expand the %d specifier.
+        yield properties, f"/run/credentials/{unit}"
         return
     name = {"nat-relay.service": "natr-singbox", "nat-relay-v1.service": "natr-adapter",
             "nat-relay-xray.service": "natr-xray", "nat-relay-xhttp-tcp.service": "natr-xhttp",
             "nat-relay-xhttp-temp.service": "natr-temp", "nat-relay-wss.service": "natr-wss",
             "nat-relay-ngrok.service": "natr-ngrok", "nat-relay-cloudflared.service": "natr-cf",
-            "nat-relay-web.service": "natr-web", "nat-relay-web-xray.service": "natr-web-xray"}[unit]
+            "nat-relay-web.service": "natr-web", "nat-relay-web-xray.service": "natr-web-xray",
+            "nat-relay-quick-origin.service": "natr-quick-origin",
+            "nat-relay-quick-edge.service": "natr-quick-edge",
+            "nat-relay-quick-ssh.service": "natr-quick-ssh"}[unit]
     gid = service_gid(name)
     directory = UNIT_DATA / name
     for folder in (UNIT_DATA, directory):
@@ -804,16 +813,20 @@ def tunnel_hosts(stream, timeout=60):
                 return
 
 
-def tunnel(port, uid, path, relay=False):
-    keyfile = ROOT / "tunnel-known-hosts"
-    atomic(keyfile, TUNNEL_HOST_KEY.encode("ascii"))
-    command = ["ssh", "-T", "-F", "/dev/null", "-o", "BatchMode=yes",
+def ssh_tunnel_args(port, keyfile):
+    return ["-T", "-F", "/dev/null", "-o", "BatchMode=yes",
                "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={keyfile}",
                "-o", "GlobalKnownHostsFile=/dev/null", "-o", "HostKeyAlgorithms=ssh-ed25519",
                "-o", "IdentityAgent=none", "-o", "PubkeyAuthentication=no",
                "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=20",
                "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=15",
                "-R", f"80:127.0.0.1:{port}", "nokey@localhost.run", "--", "--output", "json"]
+
+
+def tunnel(port, uid, path, relay=False):
+    keyfile = ROOT / "tunnel-known-hosts"
+    atomic(keyfile, TUNNEL_HOST_KEY.encode("ascii"))
+    command = ["ssh", *ssh_tunnel_args(port, keyfile)]
     output = ROOT / "xhttp-temp.txt"
     output.unlink(missing_ok=True)
     print(f"正在申请临时域名，回源 127.0.0.1:{port}；Ctrl+C 关闭。", flush=True)
@@ -986,6 +999,7 @@ def edge_config(host, port, token):
 
 def check_edge_egress():
     checks = (
+        ("localhost.run", "localhost.run", 22),
         ("ngrok", "connect.ngrok-agent.com", 443),
         ("ngrok HTTPS CRL", "crl.ngrok-agent.com", 443),
         ("Cloudflare 区域 1", "region1.v2.argotunnel.com", 7844),
@@ -1017,19 +1031,24 @@ def check_edge_egress():
             print(f"{label} {host}:{port} TCP 未连通（{'；'.join(failures)}）", flush=True)
 
 
-def cloudflared_binary():
+def cloudflared_binary(quick=False):
     import platform
     from urllib.request import urlopen
 
     managed = Path("/usr/local/lib/nat-relay/cloudflared")
+    def supports(path):
+        args = ["tunnel"] if quick else ["tunnel", "run"]
+        flag = "--no-prechecks" if quick else "--token-file"
+        result = subprocess.run([path, *args, "--help"], capture_output=True, text=True)
+        return result.returncode == 0 and flag in result.stdout
+
     for path in (shutil.which("cloudflared"), managed if managed.is_file() else None):
         if path:
-            result = subprocess.run([path, "tunnel", "run", "--help"], capture_output=True, text=True)
-            if result.returncode == 0 and "--token-file" in result.stdout:
+            if supports(path):
                 return path
     arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
     if not arch:
-        raise ValueError("此架构请先安装支持 --token-file 的官方 cloudflared")
+        raise ValueError("此架构请先安装最新官方 cloudflared")
     with urlopen("https://api.github.com/repos/cloudflare/cloudflared/releases/latest", timeout=20) as response:
         release = json.load(response)
     asset = next((a for a in release["assets"] if a["name"] == f"cloudflared-linux-{arch}"), {})
@@ -1047,6 +1066,8 @@ def cloudflared_binary():
         if "sha256:" + sha.hexdigest() != digest:
             raise ValueError("cloudflared 下载文件的 SHA-256 校验失败")
         staged.chmod(0o755)
+        if not supports(staged):
+            raise ValueError("官方 cloudflared 缺少所需启动参数")
         os.replace(staged, managed)
     return managed
 
@@ -1078,6 +1099,144 @@ def verify_websocket(host, path, unit):
             conn.close()
         time.sleep(2)
     raise ValueError(f"{host}:443 的 WebSocket 握手未就绪（{reason}）。请查看 journalctl -u {unit} -n 25。")
+
+
+def edge_origin(xray, identity, port, doh):
+    if identity.is_file():
+        keys = json.loads(identity.read_text())
+    else:
+        generated = run(xray, "vlessenc", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+        match = re.search(r'"decryption"\s*:\s*"([^"]+)"\s*,?\s*"encryption"\s*:\s*"([^"]+)"', generated)
+        if match is None:
+            raise ValueError("当前 Xray 缺少 VLESS Encryption，请升级 Xray-core")
+        keys = {**credentials(), "decrypt": match[1], "encrypt": match[2]}
+        atomic(identity, dump(keys).encode())
+    inbound = {"tag": "wss-edge", "listen": "127.0.0.1", "port": port, "protocol": "vless",
+               "settings": {"clients": [{"id": keys["uuid"]}], "decryption": keys["decrypt"]},
+               "streamSettings": {"network": "ws", "security": "none",
+                                  "wsSettings": {"path": keys["path"]}}}
+    server = xray_config([inbound], doh)
+    server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        draft = Path(tmp) / "check.json"
+        atomic(draft, dump(server).encode())
+        run(xray, "run", "-test", "-c", draft)
+    return server, keys
+
+
+def export_edge_link(host, keys, path, label):
+    params = urlencode(dict(type="ws", security="tls", encryption=keys["encrypt"],
+                            host=host, sni=host, alpn="http/1.1", path=keys["path"]))
+    link = f"vless://{keys['uuid']}@{host}:443?{params}#{label}"
+    atomic(path, (link + "\n").encode())
+    print(link, flush=True)
+
+
+QUICK_UNIT = "nat-relay-quick-edge.service"
+QUICK_SSH_UNIT = "nat-relay-quick-ssh.service"
+QUICK_HOST = re.compile(r"https://([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com)(?![a-z0-9.-])")
+
+
+def quick_tunnel_host(unit=QUICK_UNIT, timeout=60):
+    deadline = time.monotonic() + timeout
+    while True:
+        current = run("systemctl", "show", "-p", "InvocationID", "--value", unit,
+                      stdout=subprocess.PIPE, text=True).stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{32}", current) and int(current, 16):
+            logs = run("journalctl", "--no-pager", "-o", "cat", "-u", unit,
+                       "_SYSTEMD_INVOCATION_ID=" + current, stdout=subprocess.PIPE, text=True).stdout
+            if unit == QUICK_SSH_UNIT:
+                for line in reversed(logs.splitlines()):
+                    host = assigned_host(line)
+                    if host:
+                        return host
+                    if line.startswith("ssh:") or line == "Host key verification failed.":
+                        raise ValueError(f"SSH 转发失败：{line[:240]}")
+            else:
+                match = QUICK_HOST.search(logs)
+                if match and "protocol=http2" in logs and "Registered tunnel connection" in logs:
+                    return match[1]
+        if time.monotonic() >= deadline:
+            port = 22 if unit == QUICK_SSH_UNIT else 7844
+            raise ValueError(f"临时域名未就绪。请检查出站 TCP {port} 和 journalctl -u {unit} -n 25。")
+        time.sleep(1)
+
+
+def deploy_quick_edge(a):
+    import fcntl
+    import shlex
+
+    if os.geteuid() or not RUNTIME_UNITS.is_dir():
+        raise ValueError("请在使用 systemd 的 Debian/Ubuntu VPS 上以 root 运行")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    with (ROOT / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        identity = ROOT / "quick-identity.json"
+        origin = ROOT / "quick-origin.json"
+        unit_path = UNIT.with_name("nat-relay-quick-origin.service")
+        uses_ssh = a.edge_provider == "localhost-run"
+        unit = QUICK_SSH_UNIT if uses_ssh else QUICK_UNIT
+        connector = UNIT.with_name(unit)
+
+        def verified_host(keys):
+            host = quick_tunnel_host(unit)
+            print(f"正在验证 {host}:443 的 HTTPS 和 WebSocket 握手。", flush=True)
+            verify_websocket(host, keys["path"], unit)
+            return host
+
+        if a.show_quick_edge:
+            if not identity.is_file() or not connector.is_file():
+                raise ValueError("请先运行 --quick-edge 安装临时入口")
+            keys = json.loads(identity.read_text())
+            host = verified_host(keys)
+        else:
+            existing_port = json.loads(origin.read_text())["inbounds"][0]["port"] if origin.is_file() else 0
+            port = a.origin_port or existing_port
+            other = QUICK_UNIT if uses_ssh else QUICK_SSH_UNIT
+            if existing_port and port != existing_port and UNIT.with_name(other).is_file():
+                raise ValueError(f"另一个连接器已使用回源端口 {existing_port}；请复用此端口")
+            if port == 0:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+            print(f"临时 HTTPS 入口的本地回源是 127.0.0.1:{port}。", flush=True)
+            if uses_ssh:
+                agent = shutil.which("ssh")
+                if not agent:
+                    run("apt-get", "update")
+                    run("apt-get", "install", "-y", "--no-install-recommends", "openssh-client")
+                    agent = shutil.which("ssh")
+                edge = TUNNEL_HOST_KEY.encode("ascii")
+                config = ROOT / "quick-ssh-host-key"
+                args = shlex.join(ssh_tunnel_args(port, "%d/config.json"))
+            else:
+                agent = cloudflared_binary(quick=True)
+                edge = b"{}\n"
+                config = ROOT / "quick-edge.yaml"
+                args = ('tunnel --config "%d/config.json" --no-autoupdate --no-prechecks '
+                        f'--protocol http2 --metrics 127.0.0.1:0 --url http://127.0.0.1:{port}')
+            xray = xray_binary()
+            server, keys = edge_origin(xray, identity, port, a.exit_doh)
+            was_installed = unit_path.exists()
+            activate(xray, server, origin, unit_path, reuse_active=True)
+            host = None
+
+            def verify():
+                nonlocal host
+                host = verified_host(keys)
+
+            try:
+                activate(agent, edge, config, connector, arguments=args,
+                         reuse_active=True, verify=verify)
+            except BaseException:
+                if not was_installed:
+                    subprocess.run(["systemctl", "disable", "--now", unit_path.name])
+                    unit_path.unlink(missing_ok=True)
+                    origin.unlink(missing_ok=True)
+                    subprocess.run(["systemctl", "daemon-reload"])
+                raise
+        filename = "quick-ssh.txt" if uses_ssh else "quick-edge.txt"
+        export_edge_link(host, keys, ROOT / filename, "NAT-TCP-Quick")
 
 
 def deploy_https_edge(a):
@@ -1123,28 +1282,10 @@ def deploy_https_edge(a):
             edge = (token + "\n").encode("ascii")
             filename, unit = "cloudflared-token", "nat-relay-cloudflared.service"
             agent_args = 'tunnel --no-autoupdate --protocol http2 run --token-file "%d/config.json"'
-        identity = ROOT / "wss-identity.json"
-        if identity.exists():
-            keys = json.loads(identity.read_text())
-        else:
-            generated = run(xray, "vlessenc", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-            match = re.search(r'"decryption"\s*:\s*"([^"]+)"\s*,?\s*"encryption"\s*:\s*"([^"]+)"', generated)
-            if match is None:
-                raise ValueError("当前 Xray 缺少 VLESS Encryption，请升级 Xray-core")
-            keys = {**credentials(), "decrypt": match[1], "encrypt": match[2]}
-            atomic(identity, dump(keys).encode())
-        tag = "wss-edge"
-        inbound = {"tag": tag, "listen": "127.0.0.1", "port": a.origin_port, "protocol": "vless",
-                   "settings": {"clients": [{"id": keys["uuid"]}], "decryption": keys["decrypt"]},
-                   "streamSettings": {"network": "ws", "security": "none",
-                                      "wsSettings": {"path": keys["path"]}}}
-        server = xray_config([inbound], a.exit_doh)
-        server["routing"]["rules"].insert(0, {"type": "field", "network": "udp", "outboundTag": "deny"})
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            draft = Path(tmp) / "check.json"
-            atomic(draft, dump(server).encode())
-            run(xray, "run", "-test", "-c", draft)
-            if uses_ngrok:
+        server, keys = edge_origin(xray, ROOT / "wss-identity.json", a.origin_port, a.exit_doh)
+        if uses_ngrok:
+            with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+                draft = Path(tmp) / "check.json"
                 atomic(draft, dump(edge).encode())
                 check = subprocess.run([agent, "config", "check", "--config", draft], capture_output=True)
                 if check.returncode:
@@ -1153,11 +1294,7 @@ def deploy_https_edge(a):
         activate(agent, edge, ROOT / filename, UNIT.with_name(unit), arguments=agent_args, reuse_active=True)
         print(f"正在验证 {a.https_edge}:443 的 HTTPS 和 WebSocket 握手。", flush=True)
         verify_websocket(a.https_edge, keys["path"], unit)
-        params = urlencode(dict(type="ws", security="tls", encryption=keys["encrypt"],
-                                host=a.https_edge, sni=a.https_edge, alpn="http/1.1", path=keys["path"]))
-        link = f"vless://{keys['uuid']}@{a.https_edge}:443?{params}#HTTPS-Edge"
-        atomic(ROOT / "wss-edge.txt", (link + "\n").encode())
-        print(link, flush=True)
+        export_edge_link(a.https_edge, keys, ROOT / "wss-edge.txt", "HTTPS-Edge")
 
 
 def deploy(a):
@@ -1384,15 +1521,36 @@ def main():
     p.add_argument("--listen-port", type=int, default=443, help="NAT HTTPS 模式的 VPS 内部 TCP 端口，默认 443")
     p.add_argument("--xhttp-temp", action="store_true", help="为 VPS 本地 XHTTP 申请临时 HTTPS 域名")
     p.add_argument("--https-edge", type=domain, metavar="DOMAIN", help="由 HTTPS 入口提供加密 VLESS WebSocket")
-    p.add_argument("--edge-provider", choices=("ngrok", "cloudflare"), default="ngrok", help="出站连接器，ngrok 用 TCP 443，Cloudflare 用 TCP 7844")
+    p.add_argument("--edge-provider", choices=("ngrok", "cloudflare", "localhost-run"),
+                   help="出站连接器，ngrok 用 TCP 443，Cloudflare 用 TCP 7844，localhost-run 用 TCP 22")
     p.add_argument("--check-egress", action="store_true", help="仅探测 VPS 到 HTTPS 隧道网关的出站 TCP 连通性")
-    p.add_argument("--origin-port", default=8001, type=int, help="隧道的 VPS 回环 TCP 端口；ngrok 可填 0 自动选择")
+    p.add_argument("--quick-edge", action="store_true", help="部署纯 TCP 的临时 HTTPS 入口，无需公网端口映射、域名或令牌")
+    p.add_argument("--show-quick-edge", action="store_true", help="验证当前临时域名并输出对应节点链接")
+    p.add_argument("--origin-port", type=int, help="隧道的 VPS 回环 TCP 端口；临时 HTTPS 默认自动选择")
     p.add_argument("--cdn", action="store_true", help="使用已有同域名 WebSocket CDN")
     p.add_argument("--relay-v1", "--multipath", action="store_true", help="启用兼容 NRP/1 的多路径适配器")
     p.add_argument("--edge-port", type=int, default=443)
     p.add_argument("--bootstrap-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     p.add_argument("--exit-doh", type=ipaddress.IPv4Address, default="1.1.1.1")
     a = p.parse_args()
+    if a.quick_edge or a.show_quick_edge:
+        has_conflict = any((a.auto, a.auto_tcp, a.nat_web, a.switch_web_port, a.ip, a.name,
+                            a.cert, a.key, a.tcp, a.udp, a.snell, a.xhttp_h3, a.xhttp_tcp,
+                            a.xhttp_temp, a.https_edge, a.cdn, a.check_egress, a.relay_v1,
+                            a.public_ports, a.edge_provider == "ngrok"))
+        if has_conflict or (a.show_quick_edge and (a.quick_edge or a.origin_port is not None)):
+            p.error("--quick-edge 与 --show-quick-edge 单独运行")
+        a.origin_port = 0 if a.origin_port is None else a.origin_port
+        a.edge_provider = a.edge_provider or "localhost-run"
+        if a.origin_port != 0 and not 1024 <= a.origin_port <= 65535:
+            p.error("--quick-edge 的回环端口为 1024–65535，或使用 0 自动选择")
+        deploy_quick_edge(a)
+        return
+    if a.origin_port is None:
+        a.origin_port = 8001
+    a.edge_provider = a.edge_provider or "ngrok"
+    if a.edge_provider == "localhost-run":
+        p.error("--edge-provider localhost-run 需要 --quick-edge 或 --show-quick-edge")
     if a.auto_tcp:
         if any((a.auto, a.nat_web, a.switch_web_port, a.https_edge, a.check_egress, a.tcp, a.udp,
                 a.snell, a.xhttp_h3, a.xhttp_temp, a.cdn, a.relay_v1)):
@@ -2371,7 +2529,7 @@ def caddy_binary():
     return binary
 NRP_FILE_NAT_WEB_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-c99e98632deab314ab491e34469960573cb58c0edbfeaf839c59e0dd422038e3  install.py
+ca98f2def7705d5605a257434ed392409c540d6f6914ecc24ce7239ab74ef6d1  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 dd8126e93df71f2ae3bf663590cd5e90ecfaebeaa0a87d50f430c209502bb60a  nat_web.py
@@ -2409,7 +2567,7 @@ oom_before=$oom_kills
 relay=(--multipath)
 for option in "$@"; do
     case "$option" in
-        --auto-tcp|--xhttp-tcp|--xhttp-tcp=*)
+        --auto-tcp|--xhttp-tcp|--xhttp-tcp=*|--quick-edge|--show-quick-edge)
             relay=()
             break
             ;;

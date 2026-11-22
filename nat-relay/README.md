@@ -26,7 +26,7 @@ sudo bash nat-relay.sh --switch-web-port --public-ports 10881,10882
 
 ## HTTPS 443 接入
 
-在 VPS 上运行 `bash nat-relay.sh --check-egress` 可探测 ngrok 的 TCP 443 和 Cloudflare 的 TCP 7844。这个命令只发起 DNS 查询和 TCP 握手。面板的常规入站端口映射与出站访问权限独立。若服务商还限制出站，需要在上游开通所选连接器的目标端口。
+在 VPS 上运行 `bash nat-relay.sh --check-egress` 可探测 localhost.run 的 TCP 22、ngrok 的 TCP 443 和 Cloudflare 的 TCP 7844。这个命令只发起 DNS 查询和 TCP 握手。面板的常规入站端口映射与出站访问权限独立。若服务商还限制出站，需要在上游开通所选连接器的目标端口。
 
 使用 ngrok 控制台分配的开发域名，在 VPS 的交互终端运行以下命令。使用 `--origin-port 0` 时，脚本会复用已安装服务的本地端口，或选一个空闲的回环端口。安装器会隐藏输入 authtoken，验证公网 HTTPS 和 WebSocket 后输出 VLESS 链接。
 
@@ -45,6 +45,26 @@ sudo bash nat-relay.sh --https-edge relay.example.com --edge-provider cloudflare
 ```
 
 按提示隐藏输入该隧道的 token。客户端使用 HTTPS/TCP 443，VPS 连接器固定使用 HTTP/2 over TCP 7844。同时运行两个连接器时，请让它们使用相同的本地回环端口。大陆线路对各入口域名的解析和连通性可能不同，可以在实际使用的宽带或移动网络上分别测试，再选择可用入口。连接器与客户端都需要能访问各自的服务端点。[Cloudflare Tunnel 防火墙端口](https://developers.cloudflare.com/tunnel/configuration/#firewall-rules) · [Cloudflare 连接器协议](https://developers.cloudflare.com/tunnel/reference/run-parameters/#protocol)
+
+### 临时 HTTPS 入口
+
+当 VPS 的公网 TCP 映射从客户端侧探测均超时，可以先检验 VPS 出站 TCP 22，再尝试临时入口。该模式默认通过 localhost.run 分配临时域名，无需自行配置域名、令牌和公网端口映射。客户端连接公网 HTTPS 443，VPS 通过出站 SSH 建立反向转发，安装器固定网关 ED25519 主机密钥。Xray 只监听 VPS 回环，拒绝 UDP 代理流量。
+
+```bash
+bash nat-relay.sh --check-egress
+sudo bash nat-relay.sh --quick-edge
+```
+
+安装器默认选空闲的本地 TCP 端口，也可用 `--origin-port 18081` 指定。它等待当前服务取得临时域名并通过公开信任链的 TLS 和 WebSocket 握手，随后输出 `NAT-TCP-Quick` VLESS 节点，并保存到 `/etc/nat-relay/quick-ssh.txt`。在 v2rayN 中使用支持 VLESS Encryption 的 Xray 内核。实际延迟以客户端经过代理请求目标网站的结果为准。
+
+免费临时域名会变更。重新读取节点时使用下面的命令，它会验证当前域名并更新链接文件。长期使用可以配置上面的命名隧道或 localhost.run 自定义域名。
+
+```bash
+sudo bash nat-relay.sh --show-quick-edge
+systemctl status nat-relay-quick-origin nat-relay-quick-ssh
+```
+
+如果出站 TCP 22 不通，可以试用 `--quick-edge --edge-provider cloudflare`，对应取回命令为 `--show-quick-edge --edge-provider cloudflare`。此模式使用 Cloudflare Quick Tunnel，固定 HTTP/2 over TCP 7844，关闭连接器启动时的 UDP 探测，节点保存到 `/etc/nat-relay/quick-edge.txt`。客户端需能访问分配到的 `trycloudflare.com` 域名，VPS 需要连接 Cloudflare 的 API 和 TCP 隧道端点。[localhost.run HTTPS 隧道](https://localhost.run/docs/http-tunnels/) · [Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
 ## 单文件安装
 
