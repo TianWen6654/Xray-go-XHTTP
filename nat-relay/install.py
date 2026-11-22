@@ -474,10 +474,21 @@ WantedBy=multi-user.target
 
 
 def xray_binary():
-    target = Path("/usr/local/lib/nat-relay/xray")
     binary = shutil.which("xray")
-    if binary or target.is_file():
-        return binary or str(target)
+    if binary:
+        return binary
+    target = Path("/usr/local/lib/nat-relay/xray")
+    directory = target.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o711)
+    info = directory.lstat()
+    if directory.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError(f"Xray 安装目录权限异常：{directory}")
+    mode = info.st_mode & 0o7777
+    # A restrictive umask can remove directory traversal for the service account.
+    if mode & 0o111 != 0o111:
+        directory.chmod(mode | 0o111)
+    if target.is_file():
+        return str(target)
     import platform
     from urllib.request import urlopen
     import zipfile
@@ -492,7 +503,6 @@ def xray_binary():
     digest = asset.get("digest") or ""
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
         raise ValueError("官方发行清单缺少有效 SHA-256，请先安装经验证的 Xray-core")
-    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
         archive = Path(tmp) / name
         sha = hashlib.sha256()

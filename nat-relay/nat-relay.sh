@@ -567,10 +567,21 @@ WantedBy=multi-user.target
 
 
 def xray_binary():
-    target = Path("/usr/local/lib/nat-relay/xray")
     binary = shutil.which("xray")
-    if binary or target.is_file():
-        return binary or str(target)
+    if binary:
+        return binary
+    target = Path("/usr/local/lib/nat-relay/xray")
+    directory = target.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o711)
+    info = directory.lstat()
+    if directory.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError(f"Xray 安装目录权限异常：{directory}")
+    mode = info.st_mode & 0o7777
+    # A restrictive umask can remove directory traversal for the service account.
+    if mode & 0o111 != 0o111:
+        directory.chmod(mode | 0o111)
+    if target.is_file():
+        return str(target)
     import platform
     from urllib.request import urlopen
     import zipfile
@@ -585,7 +596,6 @@ def xray_binary():
     digest = asset.get("digest") or ""
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
         raise ValueError("官方发行清单缺少有效 SHA-256，请先安装经验证的 Xray-core")
-    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
         archive = Path(tmp) / name
         sha = hashlib.sha256()
@@ -2361,7 +2371,7 @@ def caddy_binary():
     return binary
 NRP_FILE_NAT_WEB_PY
 (cd -- "$stage" && sha256sum --check --status <<'NRP_SHA256'
-12e419cfdf048220535ad87bf264af5e5861504451c297a291dd396993db3b7c  install.py
+c99e98632deab314ab491e34469960573cb58c0edbfeaf839c59e0dd422038e3  install.py
 f09db0ef6fcb0dd404f88dd53b74f2555fa345a0210161fca7e0d7ae71308a1e  relay_v1.py
 291eeb242df5a7f625441c1c1aad76bf8e0fd5e5a86805a0ed1cde59582f4f9a  multipath.py
 dd8126e93df71f2ae3bf663590cd5e90ecfaebeaa0a87d50f430c209502bb60a  nat_web.py
